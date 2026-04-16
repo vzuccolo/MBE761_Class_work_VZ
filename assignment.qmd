@@ -1,0 +1,2191 @@
+---
+title: "Assignment"
+format: html
+editor: visual
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+setwd("C:/Users/vezuc/OneDrive - Florida International University/PhD/Classes/Bayesian")
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+suppressWarnings(suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)     
+  library(stringr)
+  library(lubridate)
+  library(purrr)
+  library(brms)
+  library(cmdstanr)
+  library(posterior)
+  library(furrr)
+  library(future)
+  }))
+
+project_dir <- "C:/Users/vezuc/OneDrive - Florida International University/PhD/Classes/Bayesian"
+srt_dir <- file.path(project_dir, "SRT files")
+
+setwd(project_dir)
+
+```
+
+## Read data
+
+```{r}
+meta <- readxl::read_excel("srt_metadata_with_tide_moon.xlsx", sheet = "srt_metadata") %>%
+  mutate(
+    file_date = as.Date(file_date),
+    year = factor(lubridate::year(file_date)),
+    month_num = lubridate::month(file_date),
+    month = factor(month.abb[month_num], levels = month.abb, ordered = TRUE),
+    day = lubridate::day(file_date),
+    tide_state = factor(tide_state),
+    moon_phase = factor(moon_phase)
+  )
+
+srt_files <- list.files(
+  path = srt_dir,
+  pattern = "\\.SRT$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+```
+
+## Function to parse one SRT file
+
+```{r}
+parse_srt_gps_fast <- function(file_path) {
+  txt <- readr::read_file(file_path)
+  
+  blocks <- strsplit(txt, "\\r?\\n\\r?\\n")[[1]]
+  blocks <- blocks[stringr::str_detect(blocks, "-->")]
+  
+  if (length(blocks) == 0) return(NULL)
+  
+  time_match <- stringr::str_match(
+    blocks,
+    "(\\d{2}):(\\d{2}):(\\d{2})[,\\.](\\d{3})\\s+-->"
+  )
+  
+  elapsed_sec <- as.numeric(time_match[,2]) * 3600 +
+    as.numeric(time_match[,3]) * 60 +
+    as.numeric(time_match[,4]) +
+    as.numeric(time_match[,5]) / 1000
+  
+  lat1 <- stringr::str_match(blocks, "[Ll]atitude[: ]+(-?\\d+\\.\\d+)")
+  lon1 <- stringr::str_match(blocks, "[Ll]ongitude[: ]+(-?\\d+\\.\\d+)")
+  
+  gps2 <- stringr::str_match(
+    blocks,
+    "GPS\\s*\\(?\\s*(-?\\d+\\.\\d+)\\s*,\\s*(-?\\d+\\.\\d+)"
+  )
+  
+  latitude <- ifelse(!is.na(lat1[,2]), as.numeric(lat1[,2]), as.numeric(gps2[,3]))
+  longitude <- ifelse(!is.na(lon1[,2]), as.numeric(lon1[,2]), as.numeric(gps2[,2]))
+  
+  dt_match <- stringr::str_match(
+    blocks,
+    "(20\\d{2}-\\d{2}-\\d{2})\\s+(\\d{2}:\\d{2}:\\d{2})"
+  )
+  
+  datetime_srt <- suppressWarnings(
+    lubridate::ymd_hms(paste(dt_match[,2], dt_match[,3]), quiet = TRUE)
+  )
+  
+  out <- tibble::tibble(
+    file_name = basename(file_path),
+    elapsed_sec = elapsed_sec,
+    latitude = latitude,
+    longitude = longitude,
+    datetime_srt = datetime_srt
+  ) %>%
+    dplyr::filter(!is.na(latitude), !is.na(longitude), !is.na(elapsed_sec))
+  
+  if (nrow(out) == 0) return(NULL)
+  
+  out
+}
+
+test1 <- parse_srt_gps_fast(srt_files[1])
+test1
+dim(test1)
+head(test1)
+
+## Extract GPS from all SRT files
+# set up parallel processing
+plan(multisession, workers = 6)
+
+# folder where one CSV per SRT file will be saved
+dir.create("gps_srt_csvs", showWarnings = FALSE)
+
+# optional: sort file list for consistency
+srt_files <- sort(srt_files)
+
+# function to process one SRT file and save one CSV per file
+process_one_srt <- function(f) {
+  
+  # create a unique output name based on the full file path
+  file_id <- normalizePath(f, winslash = "/") %>%
+    stringr::str_remove("\\.[Ss][Rr][Tt]$") %>%
+    gsub("[^A-Za-z0-9_]+", "_", .)
+  
+  out_file <- file.path("gps_srt_csvs", paste0(file_id, ".csv"))
+  
+  # skip if this file has already been processed
+  if (file.exists(out_file)) {
+    message("Skipping already processed file: ", basename(f))
+    return(NULL)
+  }
+  
+  message("Processing: ", basename(f))
+  
+  # parse SRT
+  out <- tryCatch(
+    parse_srt_gps_fast(f),
+    error = function(e) {
+      message("Failed: ", basename(f), " | Error: ", e$message)
+      return(NULL)
+    }
+  )
+  
+  # save result
+  if (!is.null(out) && nrow(out) > 0) {
+    write_csv(out, out_file)
+  } else {
+    # save empty file so failed/empty files are not retried endlessly
+    write_csv(tibble(), out_file)
+  }
+  
+  return(NULL)
+}
+
+# process all SRT files
+future_walk(srt_files, process_one_srt)
+
+# combine all per-file CSVs into one dataset
+csv_files <- list.files(
+  "gps_srt_csvs",
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+gps_raw <- csv_files %>%
+  map_dfr(function(x) {
+    df <- read_csv(x, show_col_types = FALSE)
+    if (nrow(df) == 0) return(NULL)
+    df
+  })
+
+# optional: save combined dataset
+write_csv(gps_raw, "gps_raw_combined.csv")
+
+# return to sequential processing
+plan(sequential)
+```
+
+```{r}
+##Sanity check
+head(srt_files)
+
+dim(gps_raw)
+head(gps_raw)
+summary(gps_raw$latitude)
+summary(gps_raw$longitude) 
+
+gps_raw %>%
+  count(file_name) %>%
+  arrange(desc(n)) %>%
+  head()
+
+summary(is.na(gps_raw$datetime_srt))
+```
+
+## Keep one GPS point every 2 seconds
+
+```{r}
+gps_2s <- gps_raw %>%
+  mutate(time_bin_2 = floor(elapsed_sec / 2) * 2) %>%
+  group_by(file_name, time_bin_2) %>%
+  slice(1) %>%
+  ungroup()
+
+##sanity check
+dim(gps_2s)
+head(gps_2s)
+summary(gps_2s$latitude)
+summary(gps_2s$longitude)
+
+##save data
+write_csv(gps_2s, "gps_2s.csv")
+```
+
+## Raw path map (2 sec intervals)
+
+```{r}
+ggplot(gps_2s, aes(x = longitude, y = latitude, group = file_name)) +
+  geom_path(alpha = 0.25, linewidth = 0.2, color = "steelblue4") +
+  coord_equal() +
+  theme_bw() +
+  labs(
+    x = "Longitude",
+    y = "Latitude",
+    title = "Tiger shark paths (2-second intervals)"
+  )
+```
+
+## Hotspot map (2 second interval)
+
+```{r}
+ggplot(gps_2s, aes(x = longitude, y = latitude)) +
+  stat_density_2d_filled(contour_var = "density") +
+  coord_equal() +
+  theme_bw() +
+  labs(
+    x = "Longitude",
+    y = "Latitude",
+    title = "Tiger shark hotspot areas (2-second intervals)"
+  )
+```
+
+## Step distance check
+
+```{r}
+##Step distance check to see if 2-second data was capturing real movement, or just noise
+
+gps_2s %>%
+  group_by(file_name) %>%
+  summarise(
+    step_dist = mean(sqrt(diff(longitude)^2 + diff(latitude)^2), na.rm = TRUE)
+  ) %>%
+  summary()
+```
+
+## GPS figure for every 2 second intervals
+
+```{r}
+library(sf)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(maptiles)
+library(tidyterra)
+
+##Make SF object
+gps_2s_sf <- gps_2s %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+
+```
+
+## Line object for shark paths
+
+```{r}
+line_df <- gps_2s %>%
+  arrange(file_name, elapsed_sec) %>%
+  group_by(file_name) %>%
+  filter(n() >= 2) %>%
+  group_split()
+
+line_list <- map(line_df, ~ st_linestring(as.matrix(.x[, c("longitude", "latitude")])))
+
+shark_lines <- st_sf(
+  file_name = map_chr(line_df, ~ .x$file_name[1]),
+  geometry = st_sfc(line_list, crs = 4326)
+)
+```
+
+## Build a bounding box around the shark tracks
+
+```{r}
+bbox_sf <- st_as_sfc(st_bbox(gps_2s_sf)) %>%
+  st_buffer(0.0008)
+```
+
+## Download satellite basemap
+
+```{r}
+sat_map <- get_tiles(
+  x = bbox_sf,
+  provider = "Esri.WorldImagery",
+  crop = TRUE,
+  zoom = 17
+)
+```
+
+## Static hotspot map on satellite imagery
+
+```{r}
+ggplot() +
+  geom_spatraster_rgb(data = sat_map) +
+  stat_density_2d_filled(
+    data = gps_2s,
+    aes(x = longitude, y = latitude),
+    contour_var = "density",
+    alpha = 0.42
+  ) +
+  coord_sf(
+    xlim = st_bbox(bbox_sf)[c("xmin", "xmax")],
+    ylim = st_bbox(bbox_sf)[c("ymin", "ymax")],
+    expand = FALSE
+  ) +
+  theme_void() +
+  labs(
+    title = "Tiger shark hotspot areas",
+    fill = "Relative use",
+    caption = "Basemap: Esri World Imagery"
+  )
+```
+
+## Flag/ remove impossible GPS points
+
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(maptiles)
+library(tidyterra)
+```
+
+```{r}
+gps_2s_sf <- gps_2s %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+```
+
+### Import water polygon
+
+```{r}
+water_poly <- st_read("Sueste_water_polygon.kml")
+```
+
+### Use water polygon to flag GSP points on land
+
+```{r}
+gps_2s_sf <- gps_2s %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+
+gps_2s_sf <- gps_2s_sf %>%
+  mutate(in_water = lengths(st_within(geometry, water_poly)) > 0)
+```
+
+### Check flagging manually
+
+```{r}
+ggplot() +
+  geom_sf(data = water_poly, fill = "lightblue", alpha = 0.2, color = "blue") +
+  geom_sf(data = gps_2s_sf, aes(color = in_water), size = 0.4, alpha = 0.5) +
+  theme_bw()
+```
+
+## Data cleaning: Keep only water point
+
+```{r}
+gps_2s_clean <- gps_2s_sf %>%
+  filter(in_water) %>%
+  st_drop_geometry()
+
+write_csv(gps_2s_clean, "gps_2s_clean.csv")
+```
+
+```{r}
+##hotspot map
+ggplot(gps_2s_clean, aes(x = longitude, y = latitude)) +
+  stat_density_2d_filled(contour_var = "density") +
+  coord_equal() +
+  theme_bw() +
+  labs(
+    x = "Longitude",
+    y = "Latitude",
+    title = "Tiger shark hotspot areas (water-only points)"
+  )
+
+##satellite hotspot map
+ggplot() +
+  geom_spatraster_rgb(data = sat_map) +
+  stat_density_2d_filled(
+    data = gps_2s_clean,
+    aes(x = longitude, y = latitude),
+    contour_var = "density",
+    alpha = 0.30,
+    bins = 6
+  ) +
+  geom_sf(
+    data = water_poly,
+    fill = NA,
+    color = "cyan",
+    linewidth = 0.6
+  ) +
+  coord_sf(
+    xlim = st_bbox(bbox_sf)[c("xmin", "xmax")],
+    ylim = st_bbox(bbox_sf)[c("ymin", "ymax")],
+    expand = FALSE
+  ) +
+  theme_void() +
+  labs(
+    title = "Tiger shark core-use areas",
+    fill = "Relative use",
+    caption = "Basemap: Esri World Imagery"
+  )
+
+```
+
+### Save flagged data
+
+```{r}
+gps_2s_flagged <- gps_2s_sf %>%
+  mutate(location_flag = if_else(in_water, "water", "land")) %>%
+  st_drop_geometry()
+
+write_csv(gps_2s_flagged, "gps_2s_flagged.csv")
+```
+
+## Stan model with one track only
+
+```{r}
+##prepare
+library(dplyr)
+library(sf)
+library(cmdstanr)
+library(posterior)
+library(ggplot2)
+
+one_file <- gps_2s_clean %>%
+  filter(file_name == unique(gps_2s_clean$file_name)[1]) %>%
+  arrange(elapsed_sec) %>%
+  slice(1:300)
+
+## convert to sf and project to meters
+one_file_sf <- one_file %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) %>%
+  st_transform(32725)
+
+## Extract x/y in meters
+coords_m <- st_coordinates(one_file_sf)
+
+one_file <- one_file %>%
+  mutate(
+    x_m = coords_m[, 1],
+    y_m = coords_m[, 2]
+  )
+
+## center the meter coordinates
+one_file <- one_file %>%
+  mutate(
+    x_obs = x_m - mean(x_m),
+    y_obs = y_m - mean(y_m)
+  )
+
+## build Stan data
+track_dat <- list(
+  N = nrow(one_file),
+  x_obs = one_file$x_obs,
+  y_obs = one_file$y_obs
+)
+
+## CRW Stan model in meters
+writeLines("
+data {
+  int<lower=3> N;
+  vector[N] x_obs;
+  vector[N] y_obs;
+}
+parameters {
+  vector[N] x_true;
+  vector[N] y_true;
+  real<lower=0, upper=1> phi;
+  real<lower=0> sigma_gps;
+  real<lower=0> sigma_move;
+}
+transformed parameters {
+  vector[N-1] dx_true;
+  vector[N-1] dy_true;
+
+  for (t in 2:N) {
+    dx_true[t-1] = x_true[t] - x_true[t-1];
+    dy_true[t-1] = y_true[t] - y_true[t-1];
+  }
+}
+model {
+  phi ~ beta(2, 2);
+
+  sigma_gps ~ exponential(1);
+  sigma_move ~ exponential(1);
+
+  x_true[1] ~ normal(x_obs[1], 1);
+  y_true[1] ~ normal(y_obs[1], 1);
+
+  x_true[2] ~ normal(x_obs[2], 1);
+  y_true[2] ~ normal(y_obs[2], 1);
+
+  for (t in 2:(N-1)) {
+    dx_true[t] ~ normal(phi * dx_true[t-1], sigma_move);
+    dy_true[t] ~ normal(phi * dy_true[t-1], sigma_move);
+  }
+
+  x_obs ~ normal(x_true, sigma_gps);
+  y_obs ~ normal(y_true, sigma_gps);
+}
+generated quantities {
+  vector[N] x_rep;
+  vector[N] y_rep;
+
+  for (t in 1:N) {
+    x_rep[t] = normal_rng(x_true[t], sigma_gps);
+    y_rep[t] = normal_rng(y_true[t], sigma_gps);
+  }
+}
+", "shark_crw_meters.stan")
+
+
+## Fit the model
+mod_crw <- cmdstan_model("shark_crw_meters.stan")
+
+fit_crw <- mod_crw$sample(
+  data = track_dat,
+  chains = 4,
+  iter_warmup = 1000,
+  iter_sampling = 1000,
+  refresh = 0
+)
+
+## check parameters estimates
+fit_crw$summary(variables = c("phi", "sigma_gps", "sigma_move"))
+
+## extract corrected path in meters
+x_post <- fit_crw$draws("x_true", format = "matrix")
+y_post <- fit_crw$draws("y_true", format = "matrix")
+
+x_mean <- colMeans(x_post) + mean(one_file$x_m)
+y_mean <- colMeans(y_post) + mean(one_file$y_m)
+
+track_fit <- one_file %>%
+  mutate(
+    x_true_m = x_mean,
+    y_true_m = y_mean
+  )
+
+## convert corrected path back to lon/lat
+x_post <- fit_crw$draws("x_true", format = "matrix")
+y_post <- fit_crw$draws("y_true", format = "matrix")
+
+x_mean <- colMeans(x_post) + mean(one_file$x_m)
+y_mean <- colMeans(y_post) + mean(one_file$y_m)
+
+track_fit <- one_file %>%
+  mutate(
+    x_true_m = x_mean,
+    y_true_m = y_mean
+  )
+
+
+##plot in meters
+ggplot() +
+  geom_path(
+    data = track_fit,
+    aes(x = x_m, y = y_m),
+    color = "grey60",
+    linewidth = 0.5,
+    alpha = 0.8
+  ) +
+  geom_path(
+    data = track_fit,
+    aes(x = x_true_m, y = y_true_m),
+    color = "red",
+    linewidth = 0.8
+  ) +
+  coord_equal() +
+  theme_bw() +
+  labs(
+    x = "X (meters)",
+    y = "Y (meters)",
+    title = "Observed and Bayesian-corrected shark path (CRW, meters)"
+  )
+
+
+## plot observed vs corrected in meters
+ggplot() +
+  geom_path(
+    data = track_fit,
+    aes(x = x_m, y = y_m),
+    color = "grey60",
+    linewidth = 0.5,
+    alpha = 0.8
+  ) +
+  geom_path(
+    data = track_fit,
+    aes(x = x_true_m, y = y_true_m),
+    color = "red",
+    linewidth = 0.8
+  ) +
+  coord_equal() +
+  theme_bw() +
+  labs(
+    x = "X (meters)",
+    y = "Y (meters)",
+    title = "Observed and Bayesian-corrected shark path (CRW, meters)"
+  )
+
+```
+
+## Quantify correction magnitude
+
+```{r}
+track_fit <- track_fit %>%
+  mutate(
+    correction_dist_m = sqrt((x_m - x_true_m)^2 + (y_m - y_true_m)^2)
+  )
+
+summary(track_fit$correction_dist_m)
+```
+
+## Batch processing using meters-based CRW Stan model
+
+```{r}
+library(dplyr)
+library(sf)
+library(posterior)
+library(purrr)
+library(readr)
+library(tidyr)
+
+fit_one_crw_track <- function(df_track, mod_crw) {
+  
+  df_track <- df_track %>%
+    arrange(elapsed_sec)
+  
+  if (nrow(df_track) < 3) return(NULL)
+  
+  track_sf <- df_track %>%
+    st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) %>%
+    st_transform(32725)
+  
+  coords_m <- st_coordinates(track_sf)
+  
+  df_track <- df_track %>%
+    mutate(
+      x_m = coords_m[, 1],
+      y_m = coords_m[, 2],
+      x_center = x_m - mean(x_m),
+      y_center = y_m - mean(y_m)
+    )
+  
+  track_dat <- list(
+    N = nrow(df_track),
+    x_obs = df_track$x_center,
+    y_obs = df_track$y_center
+  )
+  
+  fit <- mod_crw$sample(
+    data = track_dat,
+    chains = 4,
+    iter_warmup = 1000,
+    iter_sampling = 1000,
+    refresh = 0
+  )
+  
+  x_post <- fit$draws("x_true", format = "matrix")
+  y_post <- fit$draws("y_true", format = "matrix")
+  
+  x_mean <- colMeans(x_post) + mean(df_track$x_m)
+  y_mean <- colMeans(y_post) + mean(df_track$y_m)
+  
+  corrected_sf <- st_as_sf(
+    tibble(x_true_m = x_mean, y_true_m = y_mean),
+    coords = c("x_true_m", "y_true_m"),
+    crs = 32725,
+    remove = FALSE
+  ) %>%
+    st_transform(4326)
+  
+  coords_ll <- st_coordinates(corrected_sf)
+  
+  param_sum <- fit$summary(variables = c("phi", "sigma_gps", "sigma_move")) %>%
+    select(variable, mean) %>%
+    pivot_wider(names_from = variable, values_from = mean)
+  
+  out <- df_track %>%
+    mutate(
+      x_true_m = x_mean,
+      y_true_m = y_mean,
+      longitude_true = coords_ll[, 1],
+      latitude_true = coords_ll[, 2],
+      correction_dist_m = sqrt((x_m - x_true_m)^2 + (y_m - y_true_m)^2),
+      phi = param_sum$phi,
+      sigma_gps = param_sum$sigma_gps,
+      sigma_move = param_sum$sigma_move
+    )
+  
+  out
+}
+
+dir.create("crw_outputs", showWarnings = FALSE)
+dir.create("crw_outputs/track_files", showWarnings = FALSE)
+dir.create("crw_outputs/batch_files", showWarnings = FALSE)
+
+track_list <- gps_2s_clean %>%
+  group_by(file_name) %>%
+  group_split()
+
+batch_size <- 10
+track_indices <- seq_along(track_list)
+batch_ids <- split(track_indices, ceiling(seq_along(track_indices) / batch_size))
+
+all_batch_files <- character()
+
+for (b in 1:1) {
+  
+  cat("Starting batch", b, "of", length(batch_ids), "\n")
+  
+  this_batch_idx <- batch_ids[[b]]
+  this_batch_tracks <- track_list[this_batch_idx]
+  batch_results <- vector("list", length(this_batch_tracks))
+  
+  for (i in seq_along(this_batch_tracks)) {
+    
+    this_track <- this_batch_tracks[[i]]
+    this_name <- this_track$file_name[1]
+    safe_name <- make.names(this_name)
+    track_outfile <- file.path("crw_outputs/track_files", paste0(safe_name, "_crw.csv"))
+    
+    if (file.exists(track_outfile)) {
+      cat("  Skipping already saved track:", this_name, "\n")
+      batch_results[[i]] <- read_csv(track_outfile, show_col_types = FALSE)
+      next
+    }
+    
+    cat("  Fitting track", i, "in batch", b, ":", this_name, "\n")
+    
+    fit_result <- tryCatch(
+      fit_one_crw_track(this_track, mod_crw),
+      error = function(e) {
+        message("    Failed on track: ", this_name)
+        message("    Error: ", e$message)
+        return(NULL)
+      }
+    )
+    
+    batch_results[[i]] <- fit_result
+    
+    if (!is.null(fit_result)) {
+      write_csv(fit_result, track_outfile)
+    }
+  }
+  
+  batch_df <- bind_rows(batch_results)
+  
+  batch_file <- file.path(
+    "crw_outputs/batch_files",
+    paste0("crw_batch_", sprintf("%03d", b), ".csv")
+  )
+  
+  write_csv(batch_df, batch_file)
+  all_batch_files <- c(all_batch_files, batch_file)
+  
+  cat("Finished batch", b, "- saved to:", batch_file, "\n")
+}
+
+batch_files <- list.files(
+  "crw_outputs/batch_files",
+  pattern = "^crw_batch_.*\\.csv$",
+  full.names = TRUE
+)
+
+gps_crw_all <- batch_files %>%
+  map_dfr(read_csv, show_col_types = FALSE)
+
+write_csv(gps_crw_all, "crw_outputs/gps_2s_clean_crw_all_tracks.csv")
+
+gps_crw_all <- gps_crw_all %>%
+  mutate(
+    correction_dist_m = sqrt((x_true_m - x_obs)^2 + (y_true_m - y_obs)^2)
+  )
+
+track_summary <- gps_crw_all %>%
+  group_by(file_name) %>%
+  summarise(
+    n = n(),
+    mean_correction = mean(correction_dist_m, na.rm = TRUE),
+    median_correction = median(correction_dist_m, na.rm = TRUE),
+    max_correction = max(correction_dist_m, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(track_summary, "crw_outputs/crw_track_summary.csv")
+
+gps_crw_all %>%
+  summarise(
+    mean_correction = mean(correction_dist_m, na.rm = TRUE),
+    median_correction = median(correction_dist_m, na.rm = TRUE),
+    max_correction = max(correction_dist_m, na.rm = TRUE)
+  )
+
+write_csv(gps_crw_all, "crw_outputs/gps_2s_clean_crw_batch1_test.csv")
+```
+
+### Run remaining batches
+
+```{r}
+track_list <- gps_2s_clean %>%
+  group_by(file_name) %>%
+  group_split()
+
+batch_size <- 10
+track_indices <- seq_along(track_list)
+batch_ids <- split(track_indices, ceiling(seq_along(track_indices) / batch_size))
+
+all_batch_files <- character()
+
+for (b in seq_along(batch_ids)) {
+  
+  cat("Starting batch", b, "of", length(batch_ids), "\n")
+  
+  this_batch_idx <- batch_ids[[b]]
+  this_batch_tracks <- track_list[this_batch_idx]
+  batch_results <- vector("list", length(this_batch_tracks))
+  
+  for (i in seq_along(this_batch_tracks)) {
+    
+    this_track <- this_batch_tracks[[i]]
+    this_name <- this_track$file_name[1]
+    safe_name <- make.names(this_name)
+    track_outfile <- file.path("crw_outputs/track_files", paste0(safe_name, "_crw.csv"))
+    
+    if (file.exists(track_outfile)) {
+      cat("  Skipping already saved track:", this_name, "\n")
+      batch_results[[i]] <- read_csv(track_outfile, show_col_types = FALSE)
+      next
+    }
+    
+    cat("  Fitting track", i, "in batch", b, ":", this_name, "\n")
+    
+    fit_result <- tryCatch(
+      fit_one_crw_track(this_track, mod_crw),
+      error = function(e) {
+        message("    Failed on track: ", this_name)
+        message("    Error: ", e$message)
+        return(NULL)
+      }
+    )
+    
+    batch_results[[i]] <- fit_result
+    
+    if (!is.null(fit_result)) {
+      write_csv(fit_result, track_outfile)
+    }
+  }
+  
+  batch_df <- bind_rows(batch_results)
+  
+  batch_file <- file.path(
+    "crw_outputs/batch_files",
+    paste0("crw_batch_", sprintf("%03d", b), ".csv")
+  )
+  
+  write_csv(batch_df, batch_file)
+  all_batch_files <- c(all_batch_files, batch_file)
+  
+  cat("Finished batch", b, "- saved to:", batch_file, "\n")
+}
+```
+
+```{r}
+batch_files <- list.files(
+  "crw_outputs/batch_files",
+  pattern = "^crw_batch_.*\\.csv$",
+  full.names = TRUE
+)
+
+gps_crw_all <- batch_files %>%
+  map_dfr(read_csv, show_col_types = FALSE)
+
+# --------------------------------------------------
+# Rejoin trusted metadata from srt_metadata_with_tide_moon
+# --------------------------------------------------
+meta_tide_moon <- readxl::read_excel(
+  "srt_metadata_with_tide_moon.xlsx",
+  sheet = "srt_metadata"
+) %>%
+  transmute(
+    file_name = as.character(file_name),
+    datetime_srt = as.POSIXct(datetime_srt, tz = "UTC"),
+    datetime_local = as.POSIXct(datetime_local, tz = "America/Noronha"),
+    tide_height_m,
+    tide_state,
+    moon_phase,
+    moon_illumination
+  ) %>%
+  distinct(file_name, .keep_all = TRUE)
+
+gps_crw_all <- gps_crw_all %>%
+  dplyr::mutate(file_name = as.character(file_name)) %>%
+  dplyr::select(-dplyr::any_of(c(
+    "datetime_srt", "datetime_local",
+    "year", "year.x", "year.y",
+    "month_num", "month_num.x", "month_num.y",
+    "month", "month.x", "month.y",
+    "file_date", "file_date.x", "file_date.y"
+  ))) %>%
+  dplyr::left_join(meta_tide_moon, by = "file_name") %>%
+  dplyr::mutate(
+    year = lubridate::year(datetime_local),
+    month_num = lubridate::month(datetime_local),
+    month = factor(
+      lubridate::month(datetime_local, label = TRUE, abbr = TRUE),
+      levels = month.abb,
+      ordered = TRUE
+    ),
+    correction_dist_m = sqrt((x_true_m - x_obs)^2 + (y_true_m - y_obs)^2)
+  )
+
+# Save the enriched canonical dataset
+write_csv(gps_crw_all, "crw_outputs/gps_2s_clean_crw_all_tracks_enriched.csv")
+
+
+# =========================================
+# LOAD CLEAN DATASET
+# =========================================
+gps_crw_all <- readr::read_csv(
+  "crw_outputs/gps_crw_all_enriched_FINAL.csv",
+  show_col_types = FALSE
+)
+
+# =========================================
+#Track-level summary
+track_summary <- gps_crw_all %>%
+  group_by(file_name) %>%
+  summarise(
+    n = n(),
+    year = first(year),
+    month = first(month),
+    tide_height_m = first(tide_height_m),
+    tide_state = first(tide_state),
+    moon_phase = first(moon_phase),
+    moon_illumination = first(moon_illumination),
+    mean_correction = mean(correction_dist_m, na.rm = TRUE),
+    median_correction = median(correction_dist_m, na.rm = TRUE),
+    max_correction = max(correction_dist_m, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(track_summary, "crw_outputs/crw_track_summary.csv")
+
+gps_crw_all %>%
+  summarise(
+    mean_correction = mean(correction_dist_m, na.rm = TRUE),
+    median_correction = median(correction_dist_m, na.rm = TRUE),
+    max_correction = max(correction_dist_m, na.rm = TRUE)
+  )
+
+write_csv(gps_crw_all, "crw_outputs/gps_crw_all_enriched_FINAL.csv")
+
+##data integrity check
+
+gps_crw_all %>%
+  dplyr::count(year, month) %>%
+  tidyr::pivot_wider(names_from = month, values_from = n, values_fill = 0)
+```
+
+## Combine and summarise
+
+```{r}
+nrow(gps_crw_all)
+n_distinct(gps_crw_all$file_name)
+
+head(track_summary)
+
+summary(track_summary$phi)
+summary(track_summary$sigma_gps)
+summary(track_summary$sigma_move)
+summary(track_summary$mean_correction)
+summary(track_summary$median_correction)
+summary(track_summary$max_correction)
+```
+
+## Corrected hotspot map
+
+```{r}
+ggplot(gps_crw_all, aes(x = x_true_m, y = y_true_m)) +
+  stat_density_2d_filled(contour_var = "density") +
+  coord_equal() +
+  theme_bw() +
+  labs(
+    x = "X (m)",
+    y = "Y (m)",
+    title = "Tiger shark hotspot areas (Bayesian-corrected positions)"
+  )
+```
+
+## Cleaned observed hotspot map
+
+```{r}
+ggplot(gps_2s_clean, aes(x = longitude, y = latitude)) +
+  stat_density_2d_filled(contour_var = "density") +
+  coord_equal() +
+  theme_bw() +
+  labs(
+    x = "Longitude",
+    y = "Latitude",
+    title = "Tiger shark hotspot areas (observed cleaned positions)"
+  )
+```
+
+## Bayesian-corrected hotspot
+
+```{r}
+library(sf)
+
+crs_proj <- 32725
+
+gps_crw_true_sf <- gps_crw_all %>%
+  st_as_sf(coords = c("x_true_m", "y_true_m"), crs = crs_proj) %>%   # use your projected CRS object/code here
+  st_transform(4326) %>%
+  mutate(
+    longitude_true = st_coordinates(.)[, 1],
+    latitude_true = st_coordinates(.)[, 2]
+  )
+
+ggplot() +
+  geom_spatraster_rgb(data = sat_map) +
+  stat_density_2d_filled(
+    data = gps_crw_true_sf,
+    aes(x = longitude_true, y = latitude_true),
+    contour_var = "density",
+    alpha = 0.30,
+    bins = 6
+  ) +
+  coord_sf(
+    xlim = st_bbox(bbox_sf)[c("xmin", "xmax")],
+    ylim = st_bbox(bbox_sf)[c("ymin", "ymax")],
+    expand = FALSE
+  ) +
+  theme_void() +
+  labs(
+    title = "Tiger shark core-use areas (Bayesian-corrected positions)",
+    fill = "Relative use",
+    caption = "Basemap: Esri World Imagery"
+  )
+```
+
+## Diagnostic comparison figure
+
+```{r}
+ggplot() +
+  geom_path(
+    data = gps_2s_clean,
+    aes(x = longitude, y = latitude, group = file_name),
+    color = "grey60",
+    alpha = 0.20,
+    linewidth = 0.15
+  ) +
+  geom_path(
+    data = gps_crw_true_sf,
+    aes(x = longitude_true, y = latitude_true, group = file_name),
+    color = "red",
+    alpha = 0.20,
+    linewidth = 0.15
+  ) +
+  coord_equal() +
+  theme_bw() +
+  labs(
+    x = "Longitude",
+    y = "Latitude",
+    title = "Observed cleaned paths (grey) and Bayesian-corrected paths (red)"
+  )
+```
+
+## Year effect and effort
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(sf)
+library(lubridate)
+
+table(gps_crw_all$year)
+```
+
+### Effort summary by year
+
+```{r}
+effort_year <- gps_crw_all %>%
+  group_by(year) %>%
+  summarise(
+    n_files = n_distinct(file_name),
+    n_points = n(),
+    mean_track_points = n() / n_distinct(file_name),
+    .groups = "drop"
+  )
+
+effort_year
+
+ggplot(effort_year, aes(x = year, y = n_files)) +
+  geom_col() +
+  theme_bw() +
+  labs(
+    x = "Year",
+    y = "Number of SRT files",
+    title = "Sampling effort by year"
+  )
+
+ggplot(effort_year, aes(x = year, y = n_points)) +
+  geom_col() +
+  theme_bw() +
+  labs(
+    x = "Year",
+    y = "Number of corrected positions",
+    title = "Corrected shark positions by year"
+  )
+```
+
+### Estimate center of use in meters by year
+
+```{r}
+library(sf)
+
+names(gps_crw_all)
+
+gps_crw_all <- gps_crw_all %>%
+  st_as_sf(coords = c("x_true_m", "y_true_m"), crs = 32725, remove = FALSE) %>%
+  st_transform(4326) %>%
+  mutate(
+    longitude_true = st_coordinates(.)[, 1],
+    latitude_true  = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry()
+
+# yearly centers in projected meters
+center_year_m <- gps_crw_all %>%
+  group_by(year) %>%
+  summarise(
+    center_x = mean(x_true_m, na.rm = TRUE),
+    center_y = mean(y_true_m, na.rm = TRUE),
+    n_files = n_distinct(file_name),
+    n_points = n(),
+    .groups = "drop"
+  )
+
+center_year_m
+
+```
+
+### Compare centroids to check if center of use differ by year
+
+```{r}
+track_centers <- gps_crw_all %>%
+  group_by(file_name, year) %>%
+  summarise(
+    center_lon = mean(longitude_true, na.rm = TRUE),
+    center_lat = mean(latitude_true, na.rm = TRUE),
+    center_x = mean(x_true_m, na.rm = TRUE),
+    center_y = mean(y_true_m, na.rm = TRUE),
+    n_points = n(),
+    .groups = "drop"
+  )
+
+## test year effect
+summary(lm(center_x ~ year, data = track_centers))
+summary(lm(center_y ~ year, data = track_centers))
+```
+
+```{r}
+library(viridis)
+
+year_centroids <- track_centers %>%
+  group_by(year) %>%
+  summarise(
+    mean_x = mean(center_x, na.rm = TRUE),
+    mean_y = mean(center_y, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+track_centers <- track_centers %>%
+  mutate(year = factor(year))
+
+year_centroids <- year_centroids %>%
+  mutate(year = factor(year))
+
+ggplot(track_centers, aes(x = center_x, y = center_y, color = year, shape = year)) +
+  geom_point(size = 2.6, alpha = 0.75) +
+  geom_point(
+    data = year_centroids,
+    aes(x = mean_x, y = mean_y, color = year),
+    size = 6,
+    shape = 4,
+    stroke = 2,
+    inherit.aes = FALSE
+  ) +
+  coord_equal() +
+  theme_bw() +
+  scale_color_viridis_d(option = "H", end = 0.9) +
+  scale_shape_manual(values = c(
+    "2022" = 16,
+    "2023" = 17,
+    "2024" = 15,
+    "2025" = 18,
+    "2026" = 8
+  )) +
+  labs(
+    x = "X (meters)",
+    y = "Y (meters)",
+    title = "Track-level centers of use by year",
+    color = "Year",
+    shape = "Year"
+  )
+```
+
+### Effort by year bar plot
+
+```{r}
+ggplot(effort_year, aes(x = year, y = n_files)) +
+  geom_col() +
+  theme_bw() +
+  labs(
+    x = "Year",
+    y = "Number of SRT files",
+    title = "Sampling effort by year"
+  )
+```
+
+## Overall hotspot figure - density in projected space (meters)
+
+```{r}
+library(dplyr)
+library(sf)
+library(terra)
+library(MASS)
+library(ggplot2)
+library(tidyterra)
+
+turbo_dark <- c(
+  "#30123B",
+  "#2C7FB8",
+  "#4AC16D",
+  "#F2C14E",
+  "#C81D11"
+)
+
+# make sure projected corrected coordinates exist
+# use gps_crw_all for corrected positions
+x_range <- range(gps_crw_all$x_true_m, na.rm = TRUE)
+y_range <- range(gps_crw_all$y_true_m, na.rm = TRUE)
+
+kde_m <- MASS::kde2d(
+  x = gps_crw_all$x_true_m,
+  y = gps_crw_all$y_true_m,
+  n = 300,
+  h = c(25, 25),
+  lims = c(x_range, y_range)
+)
+
+kde_m_df <- expand.grid(
+  x = kde_m$x,
+  y = kde_m$y
+)
+kde_m_df$z <- as.vector(kde_m$z)
+
+vals_m <- kde_m_df$z
+q_m <- quantile(vals_m, probs = seq(0, 1, length.out = 6), na.rm = TRUE)
+
+q_m[1] <- min(vals_m, na.rm = TRUE) - 1e-12
+q_m[length(q_m)] <- max(vals_m, na.rm = TRUE) + 1e-12
+
+kde_m_df <- kde_m_df %>%
+  mutate(
+    use_class = cut(
+      z,
+      breaks = q_m,
+      include.lowest = TRUE,
+      labels = c("Very low", "Low", "Moderate", "High", "Very high")
+    )
+  )
+
+p_hotspot_overall <- ggplot(kde_m_df, aes(x = x, y = y, fill = use_class)) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_manual(
+    values = turbo_dark,
+    drop = FALSE,
+    name = "Relative use"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 10)
+  ) +
+  labs(
+    x = "X (m)",
+    y = "Y (m)",
+    title = "Tiger shark core-use areas"
+  )
+
+p_hotspot_overall
+```
+
+## Hotspot by year
+
+## Kernel density estimation overlayed on basemap hotspot figure
+
+```{r}
+
+turbo_dark <- c(
+  "#30123B",
+  "#2C7FB8",
+  "#4AC16D",
+  "#F2C14E",
+  "#C81D11"
+)
+
+# --------------------------------------------------
+# 1. KDE in projected space (meters)
+# --------------------------------------------------
+x_range_m <- range(gps_crw_all$x_true_m, na.rm = TRUE)
+y_range_m <- range(gps_crw_all$y_true_m, na.rm = TRUE)
+
+kde_m <- MASS::kde2d(
+  x = gps_crw_all$x_true_m,
+  y = gps_crw_all$y_true_m,
+  n = 300,
+  h = c(25, 25),
+  lims = c(x_range_m, y_range_m)
+)
+
+# --------------------------------------------------
+# 2. Convert KDE grid to raster in UTM 25S
+# --------------------------------------------------
+kde_m_df <- expand.grid(
+  x = kde_m$x,
+  y = kde_m$y
+)
+kde_m_df$z <- as.vector(kde_m$z)
+
+kde_rast_utm <- rast(
+  kde_m_df,
+  type = "xyz",
+  crs = "EPSG:32725"
+)
+
+names(kde_rast_utm) <- "density"
+
+# --------------------------------------------------
+# 3. Reproject to lon/lat
+# --------------------------------------------------
+kde_rast_ll <- terra::project(kde_rast_utm, "EPSG:4326")
+kde_rast_ll[kde_rast_ll < quantile(values(kde_rast_ll), 0.05, na.rm = TRUE)] <- NA
+
+# --------------------------------------------------
+# 4. Convert to data frame for plotting
+# --------------------------------------------------
+# trim only the weakest background
+vals <- terra::values(kde_rast_ll)[, 1]
+thresh <- quantile(vals[vals > 0], 0.15, na.rm = TRUE)
+
+kde_trim <- kde_rast_ll
+kde_trim[kde_trim < thresh] <- NA
+
+# convert to data frame and drop NA cells
+kde_df_plot <- as.data.frame(kde_trim, xy = TRUE, na.rm = TRUE)
+names(kde_df_plot)[3] <- "density"
+
+# --------------------------------------------------
+# 5. Basemap + filled contours
+# --------------------------------------------------
+p_basemap_context <- ggplot() +
+  geom_spatraster_rgb(data = sat_map) +
+  geom_raster(
+    data = kde_df_plot,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.65
+  ) +
+  coord_sf(
+    xlim = st_bbox(bbox_sf)[c("xmin", "xmax")],
+    ylim = st_bbox(bbox_sf)[c("ymin", "ymax")],
+    expand = FALSE
+  ) +
+  scale_fill_gradientn(
+    colours = turbo_dark,
+    values = scales::rescale(c(0, 0.05, 0.15, 0.40, 1)),
+    name = "Relative use",
+    breaks = c(
+    min(kde_df_plot$density, na.rm = TRUE),
+    max(kde_df_plot$density, na.rm = TRUE)
+  ),
+  labels = c("Low", "Very high")
+) +
+guides(
+  fill = guide_colorbar(reverse = TRUE)
+    ) +
+  theme_void(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.title = element_text(face = "bold"),
+    legend.background = element_rect(fill = "white", colour = "grey80")
+  ) +
+  labs(
+    title = "Tiger shark core-use areas",
+    caption = "Basemap: Esri World Imagery"
+  )
+
+p_basemap_context
+```
+
+### Test for month effect
+
+```{r}
+gps_crw_all %>%
+  dplyr::count(year, month) %>%
+  tidyr::pivot_wider(names_from = month, values_from = n, values_fill = 0)
+
+gps_month <- gps_crw_all %>%
+  dplyr::filter(!is.na(year), !is.na(month))
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(scales)
+library(grid)
+
+turbo_dark <- c(
+  "#30123B",
+  "#2C7FB8",
+  "#4AC16D",
+  "#F2C14E",
+  "#C81D11"
+)
+
+# -----------------------------------------
+# Use cleaned dataset as-is
+# -----------------------------------------
+gps_month <- gps_crw_all %>%
+  dplyr::filter(
+    !is.na(month),
+    !is.na(month_num),
+    !is.na(year)
+  )
+
+#check Year X Month sampling balance
+gps_month %>%
+  dplyr::count(year, month) %>%
+  tidyr::pivot_wider(names_from = month, values_from = n, values_fill = 0)
+
+# optional checks
+table(gps_month$month, useNA = "ifany")
+table(gps_month$year, useNA = "ifany")
+
+effort_month <- gps_month %>%
+  group_by(month, month_num) %>%
+  summarise(
+    n_files = n_distinct(file_name),
+    n_points = n(),
+    mean_track_points = n() / n_distinct(file_name),
+    .groups = "drop"
+  ) %>%
+  arrange(month_num)
+
+print(effort_month)
+
+p_effort_month_files <- ggplot(effort_month, aes(x = month, y = n_files)) +
+  geom_col(fill = "grey40") +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(
+    x = "Month",
+    y = "Number of SRT files",
+    title = "Sampling effort by month"
+  )
+
+p_effort_month_points <- ggplot(effort_month, aes(x = month, y = n_points)) +
+  geom_col(fill = "grey40") +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(
+    x = "Month",
+    y = "Number of corrected positions",
+    title = "Corrected shark positions by month"
+  )
+
+print(p_effort_month_files)
+print(p_effort_month_points)
+
+p_hotspot_month <- ggplot(gps_month, aes(x = longitude_true, y = latitude_true)) +
+  stat_density_2d_filled(
+    contour_var = "density",
+    bins = 5
+  ) +
+  coord_equal() +
+  facet_wrap(~ month) +
+  scale_fill_manual(
+    values = turbo_dark,
+    name = "Relative use",
+    labels = c("Very low", "Low", "Moderate", "High", "Very high")
+  ) +
+  scale_x_continuous(
+    breaks = pretty_breaks(n = 2),
+    labels = label_number(accuracy = 0.001)
+  ) +
+  scale_y_continuous(
+    breaks = pretty_breaks(n = 3),
+    labels = label_number(accuracy = 0.001)
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    panel.spacing = unit(1, "lines"),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 10)
+  ) +
+  labs(
+    x = "Longitude",
+    y = "Latitude",
+    title = "Tiger shark hotspot areas by month"
+  )
+
+print(p_hotspot_month)
+
+track_centers_month <- gps_month %>%
+  group_by(file_name, month, month_num) %>%
+  summarise(
+    center_lon = mean(longitude_true, na.rm = TRUE),
+    center_lat = mean(latitude_true, na.rm = TRUE),
+    center_x = mean(x_true_m, na.rm = TRUE),
+    center_y = mean(y_true_m, na.rm = TRUE),
+    n_points = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(month_num)
+
+print(head(track_centers_month))
+
+month_centroids <- track_centers_month %>%
+  group_by(month, month_num) %>%
+  summarise(
+    mean_x = mean(center_x, na.rm = TRUE),
+    mean_y = mean(center_y, na.rm = TRUE),
+    n_files = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(month_num)
+
+p_centers_month <- ggplot(track_centers_month, aes(x = center_x, y = center_y, color = month, shape = month)) +
+  geom_point(size = 2.4, alpha = 0.75) +
+  geom_point(
+    data = month_centroids,
+    aes(x = mean_x, y = mean_y, color = month),
+    shape = 4,
+    stroke = 2,
+    size = 5.5,
+    inherit.aes = FALSE
+  ) +
+  coord_equal() +
+  scale_color_viridis_d(option = "C", end = 0.9, name = "Month") +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 10)
+  ) +
+  labs(
+    x = "X (meters)",
+    y = "Y (meters)",
+    title = "Track-level centers of use by month"
+  )
+
+print(p_centers_month)
+
+p_center_y_month <- ggplot(track_centers_month, aes(x = month, y = center_y, fill = month)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_fill_viridis_d(option = "C", end = 0.9, guide = "none") +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(
+    x = "Month",
+    y = "Track center Y (meters)",
+    title = "North–south center of shark space use by month"
+  )
+
+p_center_x_month <- ggplot(track_centers_month, aes(x = month, y = center_x, fill = month)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_fill_viridis_d(option = "C", end = 0.9, guide = "none") +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(
+    x = "Month",
+    y = "Track center X (meters)",
+    title = "East–west center of shark space use by month"
+  )
+
+print(p_center_y_month)
+print(p_center_x_month)
+
+lm_month_y <- lm(center_y ~ month, data = track_centers_month)
+lm_month_x <- lm(center_x ~ month, data = track_centers_month)
+
+summary(lm_month_y)
+summary(lm_month_x)
+
+month_summary <- track_centers_month %>%
+  group_by(month, month_num) %>%
+  summarise(
+    n_files = n(),
+    mean_center_x = mean(center_x, na.rm = TRUE),
+    mean_center_y = mean(center_y, na.rm = TRUE),
+    sd_center_x = sd(center_x, na.rm = TRUE),
+    sd_center_y = sd(center_y, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(month_num)
+
+print(month_summary)
+
+write_csv(effort_month, "effort_by_month.csv")
+write_csv(track_centers_month, "track_centers_by_month.csv")
+write_csv(month_summary, "month_center_summary.csv")
+```
+
+### GAM
+
+```{r}
+library(mgcv)
+
+track_centers_month <- track_centers_month %>%
+  dplyr::left_join(
+    gps_crw_all %>%
+      dplyr::select(file_name, year) %>%
+      distinct(),
+    by = "file_name"
+  ) %>%
+  dplyr::mutate(
+    month = factor(month, levels = month.abb, ordered = TRUE),
+    year = factor(year)
+  )
+
+#check data structure
+str(track_centers_month)
+
+#GAM model North-South
+gam_month_y <- mgcv::gam(
+  center_y ~ month + s(year, bs = "re"),
+  data = track_centers_month,
+  method = "REML"
+)
+
+summary(gam_month_y)
+
+#GAM model East-West
+gam_month_x <- mgcv::gam(
+  center_x ~ month + s(year, bs = "re"),
+  data = track_centers_month,
+  method = "REML"
+)
+
+summary(gam_month_x)
+```
+
+## GAM Temporal and environmental drivers
+
+```{r}
+#check data
+names(gps_crw_all)
+
+# 1. Build track-level environmental data
+# --------------------------------------------------
+env_track <- gps_crw_all %>%
+  dplyr::group_by(file_name) %>%
+  dplyr::summarise(
+    tide_height_m = mean(tide_height_m, na.rm = TRUE),
+    tide_state = names(sort(table(tide_state), decreasing = TRUE))[1],
+    moon_phase = names(sort(table(moon_phase), decreasing = TRUE))[1],
+    moon_illumination = mean(moon_illumination, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --------------------------------------------------
+# 2. Rebuild track-level analysis dataset from scratch
+#    IMPORTANT: month must be an unordered factor here
+# --------------------------------------------------
+track_centers_env <- track_centers_month %>%
+  dplyr::select(
+    file_name, month, month_num, center_lon, center_lat,
+    center_x, center_y, n_points, year
+  ) %>%
+  dplyr::left_join(env_track, by = "file_name") %>%
+  dplyr::mutate(
+    month = factor(as.character(month), levels = month.abb, ordered = FALSE),
+    year = factor(as.character(year)),
+    tide_state = factor(tide_state),
+    moon_phase = factor(moon_phase)
+  ) %>%
+  droplevels()
+
+# --------------------------------------------------
+# 3. Keep only complete cases needed for this model
+# --------------------------------------------------
+track_centers_env <- track_centers_env %>%
+  dplyr::filter(
+    !is.na(center_y),
+    !is.na(center_x),
+    !is.na(month),
+    !is.na(year),
+    !is.na(tide_height_m),
+    !is.na(moon_illumination)
+  ) %>%
+  droplevels()
+
+# --------------------------------------------------
+# 4. Check actual factor levels used in the model
+# --------------------------------------------------
+print(levels(track_centers_env$month))
+print(levels(track_centers_env$year))
+```
+
+```{r}
+#| cache: true
+
+##North-south (center_y) GAM
+gam_y_full <- mgcv::gam(
+  center_y ~ month + s(year, bs = "re") + s(tide_height_m) + s(moon_illumination),
+  data = track_centers_env,
+  method = "REML"
+)
+
+## East-West (center_x) GAM
+gam_x_full <- mgcv::gam(
+  center_x ~ month + s(year, bs = "re") + s(tide_height_m) + s(moon_illumination),
+  data = track_centers_env,
+  method = "REML"
+)
+```
+
+```{r}
+#| cache: true
+
+summary(gam_y_full)
+summary(gam_x_full)
+
+#GAM diagnostics
+gam.check(gam_y_full)
+gam.check(gam_x_full)
+
+#Residuals diagnostics
+par(mfrow = c(2,2))
+plot(gam_y_full, residuals = TRUE, pch = 16)
+plot(gam_x_full, residuals = TRUE, pch = 16)
+par(mfrow = c(1,1))
+```
+
+```{r}
+#| cache: false
+#| include: false
+
+## Build prediction using year 2024 - year with the broader sampling coverage
+ref_year <- "2024"
+if (!ref_year %in% levels(track_centers_env$year)) {
+  ref_year <- levels(track_centers_env$year)[1]
+}
+
+pred_month <- data.frame(
+  month = factor(levels(track_centers_env$month), levels = levels(track_centers_env$month)),
+  year = factor(ref_year, levels = levels(track_centers_env$year)),
+  tide_height_m = mean(track_centers_env$tide_height_m, na.rm = TRUE),
+  moon_illumination = mean(track_centers_env$moon_illumination, na.rm = TRUE)
+)
+
+cat("pred_month built successfully\n")
+```
+
+## 2-seconds GPS locations GAM with random effect
+
+```{r}
+##create clean 2-sec dataset before modelling
+gps_env <- gps_crw_all %>%
+  dplyr::filter(
+    !is.na(y_true_m),
+    !is.na(x_true_m),
+    !is.na(month),
+    !is.na(year),
+    !is.na(tide_height_m),
+    !is.na(moon_illumination),
+    !is.na(file_name)
+  ) %>%
+  dplyr::mutate(
+    month = factor(as.character(month), levels = month.abb),
+    year = factor(year),
+    file_name = factor(file_name)
+  ) %>%
+  droplevels()
+
+##sanity check
+dplyr::glimpse(gps_env)
+```
+
+```{r}
+## 2 seconds GAM model
+gam_2s_y <- mgcv::bam(
+  y_true_m ~ 
+    s(x_true_m, k = 20) +
+    month +
+    s(tide_height_m, k = 10) +
+    s(moon_illumination, k = 10) +
+    s(year, bs = "re") +
+    s(file_name, bs = "re"),
+  data = gps_env,
+  method = "fREML",
+  discrete = TRUE
+)
+
+saveRDS(gam_2s_y, "gam_2s_y.rds")
+```
+
+## Relevant statistics
+
+```{r}
+cat("GAM Y:\n")
+cat("Deviance explained:", summary(gam_y_full)$dev.expl, "\n")
+cat("Adjusted R2:", summary(gam_y_full)$r.sq, "\n\n")
+
+cat("GAM X:\n")
+cat("Deviance explained:", summary(gam_x_full)$dev.expl, "\n")
+cat("Adjusted R2:", summary(gam_x_full)$r.sq, "\n")
+```
+
+## Figures set
+
+### Figure 1 — Spatial context
+
+```{r}
+p_basemap_context <- ggplot() +
+  geom_spatraster_rgb(data = sat_map) +
+  geom_raster(
+    data = kde_df_plot,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.65
+  ) +
+  coord_sf(
+    xlim = st_bbox(bbox_sf)[c("xmin", "xmax")],
+    ylim = st_bbox(bbox_sf)[c("ymin", "ymax")],
+    expand = FALSE
+  ) +
+  scale_fill_gradientn(
+  colours = turbo_dark,
+  values = scales::rescale(c(0, 0.05, 0.15, 0.40, 1)),
+  name = "Relative space use",
+  breaks = c(
+    min(kde_df_plot$density, na.rm = TRUE),
+    max(kde_df_plot$density, na.rm = TRUE)
+  ),
+  labels = c("Low", "High"),
+  guide = guide_colorbar(
+    reverse = TRUE,
+    barheight = unit(3.5, "cm"),
+    barwidth  = unit(0.4, "cm")
+      )
+  ) +
+  theme_void(base_size = 13) +
+  theme(
+    legend.position = "right",
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(0.4, "cm"),
+    legend.title = element_text(size = 10.5, face = "bold"),
+    legend.text = element_text(size = 9.5),
+    legend.background = element_rect(fill = "white", colour = "grey80")
+  ) +
+  labs(
+    title = "Tiger shark core-use areas",
+    caption = "Basemap: Esri World Imagery"
+  )
+
+p_basemap_context
+```
+
+### Figure 2: Predicted month effect
+
+```{r}
+pred_month <- data.frame(
+  month = factor(levels(track_centers_env$month), levels = levels(track_centers_env$month)),
+  month_num = match(levels(track_centers_env$month), month.abb),  # 1–12
+  year = factor(ref_year, levels = levels(track_centers_env$year)),
+  tide_height_m = mean(track_centers_env$tide_height_m, na.rm = TRUE),
+  moon_illumination = mean(track_centers_env$moon_illumination, na.rm = TRUE)
+)
+
+#North–south (center_y)
+pred_month_y$month_num <- match(pred_month_y$month, month.abb)
+
+p_month_y <- ggplot(pred_month_y, aes(x = month_num, y = fit, group = 1)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "North–south position (UTM, m)",
+    title = "North–south shift"
+  )
+
+#East-west (center_x)
+pred_month_x$month_num <- match(pred_month_x$month, month.abb)
+
+p_month_x <- ggplot(pred_month_x, aes(x = month_num, y = fit, group = 1)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "East–west position (UTM, m)",
+    title = "East–west shift"
+  )
+
+
+#combine p_month_y and p_month_x
+library(patchwork)
+
+figure_month <- p_month_y + p_month_x +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Seasonal variation in shark space use",
+    tag_levels = "A",
+    theme = theme(
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+  )
+
+figure_month
+
+ggsave(
+  filename = "figure_month_effects.png",
+  plot = figure_month,
+  width = 11,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+```{r}
+## Predict center_y with confidence intervals
+pred_y <- predict(gam_y_full, newdata = pred_month, type = "link", se.fit = TRUE)
+
+pred_month_y <- pred_month %>%
+  dplyr::mutate(
+    fit = pred_y$fit,
+    se = pred_y$se.fit,
+    lower = fit - 1.96 * se,
+    upper = fit + 1.96 * se,
+    month_num = match(month, month.abb)
+  )
+
+
+## Plot predicted month effect for center_y
+p_month_y <- ggplot(pred_month_y, aes(x = month, y = fit, group = 1)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(
+    x = "Month",
+    y = "Predicted center_y",
+    title = "Predicted north–south shark space use by month"
+  )
+
+print(p_month_y)
+```
+
+```{r}
+## Predict center_x with confidence intervals
+pred_x <- predict(gam_x_full, newdata = pred_month, type = "link", se.fit = TRUE)
+
+pred_month_x <- pred_month %>%
+  dplyr::mutate(
+    fit = pred_y$fit,
+    se = pred_y$se.fit,
+    lower = fit - 1.96 * se,
+    upper = fit + 1.96 * se,
+    month_num = match(month, month.abb)
+  )
+
+
+## Plot predicted month effect for center_x
+p_month_x <- ggplot(pred_month_x, aes(x = month, y = fit, group = 1)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(
+    x = "Month",
+    y = "Predicted center_x",
+    title = "Predicted east–west shark space use by month"
+  )
+
+print(p_month_x)
+```
+
+### Figure 3: GAM smooths (tide+moon+year)
+
+```{r}
+library(mgcv)
+
+# save current graphics settings so you can restore them after
+old_par <- par(no.readonly = TRUE)
+
+# 2 x 2 layout
+par(
+  mfrow = c(2, 2),
+  mar = c(4.5, 4.5, 3, 1),
+  oma = c(0, 0, 2, 0),
+  cex.main = 1.1,
+  cex.lab = 1.1,
+  cex.axis = 1
+)
+
+# A. Tide effect on north–south position
+plot(
+  gam_y_full,
+  select = 2,   # s(tide_height_m)
+  shade = TRUE,
+  shade.col = "grey80",
+  seWithMean = TRUE,
+  rug = TRUE,
+  residuals = FALSE,
+  main = "A. Tide effect on north–south position",
+  xlab = "Tide height (m)",
+  ylab = "Effect on position (m)"
+)
+
+# B. Moon effect on north–south position
+plot(
+  gam_y_full,
+  select = 3,   # s(moon_illumination)
+  shade = TRUE,
+  shade.col = "grey80",
+  seWithMean = TRUE,
+  rug = TRUE,
+  residuals = FALSE,
+  main = "B. Moon effect on north–south position",
+  xlab = "Moon illumination",
+  ylab = "Effect on position (m)"
+)
+
+# C. Tide effect on east–west position
+plot(
+  gam_x_full,
+  select = 2,   # s(tide_height_m)
+  shade = TRUE,
+  shade.col = "grey80",
+  seWithMean = TRUE,
+  rug = TRUE,
+  residuals = FALSE,
+  main = "C. Tide effect on east–west position",
+  xlab = "Tide height (m)",
+  ylab = "Effect on position (m)"
+)
+
+# D. Moon effect on east–west position
+plot(
+  gam_x_full,
+  select = 3,   # s(moon_illumination)
+  shade = TRUE,
+  shade.col = "grey80",
+  seWithMean = TRUE,
+  rug = TRUE,
+  residuals = FALSE,
+  main = "D. Moon effect on east–west position",
+  xlab = "Moon illumination",
+  ylab = "Effect on position (m)"
+)
+
+# overall title
+mtext(
+  "Environmental effects on tiger shark space use",
+  outer = TRUE,
+  cex = 1.4,
+  font = 2
+)
+
+# restore previous graphics settings
+par(old_par)
+
+png("figure_3_environmental_effects.png", width = 2000, height = 1600, res = 300)
+
+old_par <- par(no.readonly = TRUE)
+
+par(
+  mfrow = c(2, 2),
+  mar = c(4.5, 4.5, 3, 1),
+  oma = c(0, 0, 2, 0),
+  cex.main = 1.1,
+  cex.lab = 1.1,
+  cex.axis = 1
+)
+
+plot(gam_y_full, select = 2, shade = TRUE, shade.col = "grey80",
+     seWithMean = TRUE, rug = TRUE, residuals = FALSE,
+     main = "A. Tide effect on north–south position",
+     xlab = "Tide height (m)", ylab = "Effect on position (m)")
+
+plot(gam_y_full, select = 3, shade = TRUE, shade.col = "grey80",
+     seWithMean = TRUE, rug = TRUE, residuals = FALSE,
+     main = "B. Moon effect on north–south position",
+     xlab = "Moon illumination", ylab = "Effect on position (m)")
+
+plot(gam_x_full, select = 2, shade = TRUE, shade.col = "grey80",
+     seWithMean = TRUE, rug = TRUE, residuals = FALSE,
+     main = "C. Tide effect on east–west position",
+     xlab = "Tide height (m)", ylab = "Effect on position (m)")
+
+plot(gam_x_full, select = 3, shade = TRUE, shade.col = "grey80",
+     seWithMean = TRUE, rug = TRUE, residuals = FALSE,
+     main = "D. Moon effect on east–west position",
+     xlab = "Moon illumination", ylab = "Effect on position (m)")
+
+mtext("Environmental effects on shark space use", outer = TRUE, cex = 1.4, font = 2)
+
+par(old_par)
+dev.off()
+```
