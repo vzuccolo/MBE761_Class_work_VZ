@@ -1,0 +1,800 @@
+---
+title: "VZ class project April 17 2026"
+format: pdf
+editor: visual
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+library(rethinking)
+library(dplyr)
+library(lubridate)
+
+
+project_dir <- "C:/Users/vezuc/OneDrive - Florida International University/PhD/Classes/Bayesian"
+```
+
+## Load prepared data
+
+```{r}
+track_centers_env <- readRDS(file.path(project_dir, "track_centers_env.rds"))
+gps_env <- readRDS(file.path(project_dir, "gps_env.rds"))
+```
+
+## Bayesian Models
+
+```{r}
+### Bayesian track-level model of movement
+
+## set factor levels
+month_levels <- if (is.factor(track_centers_env$month)) {
+  levels(track_centers_env$month)
+} else {
+  unique(as.character(track_centers_env$month))
+}
+
+year_levels <- sort(unique(c(
+  as.character(track_centers_env$year),
+  as.character(gps_env$year)
+)))
+
+
+## Track-level Gaussian models
+
+track_bayes <- track_centers_env %>%
+  filter(
+    !is.na(center_y),
+    !is.na(center_x),
+    !is.na(month),
+    !is.na(year),
+    !is.na(tide_height_m),
+    !is.na(moon_illumination)
+  ) %>%
+  mutate(
+    month = factor(as.character(month), levels = month_levels),
+    year  = factor(as.character(year), levels = year_levels),
+    month_id = as.integer(month),
+    year_id  = as.integer(year),
+    tide_s = as.numeric(scale(tide_height_m)),
+    moon_s = as.numeric(scale(moon_illumination)),
+    center_y_s = as.numeric(scale(center_y)),
+    center_x_s = as.numeric(scale(center_x))
+  )
+
+d_track_y_scaled <- list(
+  N = nrow(track_bayes),
+  Y = track_bayes$center_y_s,
+  month = track_bayes$month_id,
+  tide = track_bayes$tide_s,
+  moon = track_bayes$moon_s,
+  year = track_bayes$year_id,
+  n_month = nlevels(track_bayes$month),
+  n_year = nlevels(track_bayes$year)
+)
+
+d_track_x_scaled <- list(
+  N = nrow(track_bayes),
+  Y = track_bayes$center_x_s,
+  month = track_bayes$month_id,
+  tide = track_bayes$tide_s,
+  moon = track_bayes$moon_s,
+  year = track_bayes$year_id,
+  n_month = nlevels(track_bayes$month),
+  n_year = nlevels(track_bayes$year)
+)
+
+m_track_y <- ulam(
+  alist(
+    Y ~ dnorm(mu, sigma),
+    mu <- a + a_month[month] + b_tide * tide + b_moon * moon + a_year[year],
+
+    a ~ dnorm(0, 1),
+    a_month[month] ~ dnorm(0, sigma_month),
+    a_year[year] ~ dnorm(0, sigma_year),
+
+    b_tide ~ dnorm(0, 1),
+    b_moon ~ dnorm(0, 1),
+
+    sigma ~ dexp(1),
+    sigma_month ~ dexp(1),
+    sigma_year ~ dexp(1)
+  ),
+  data = d_track_y_scaled,
+  chains = 4, cores = 4, iter = 2000
+)
+
+m_track_x <- ulam(
+  alist(
+    Y ~ dnorm(mu, sigma),
+    mu <- a + a_month[month] + b_tide * tide + b_moon * moon + a_year[year],
+
+    a ~ dnorm(0, 1),
+    a_month[month] ~ dnorm(0, sigma_month),
+    a_year[year] ~ dnorm(0, sigma_year),
+
+    b_tide ~ dnorm(0, 1),
+    b_moon ~ dnorm(0, 1),
+
+    sigma ~ dexp(1),
+    sigma_month ~ dexp(1),
+    sigma_year ~ dexp(1)
+  ),
+  data = d_track_x_scaled,
+  chains = 4, cores = 4, iter = 2000
+)
+```
+
+```{r}
+### 2-second GPS cell-based model
+
+cell_size <- 25
+
+gps_use <- gps_env %>%
+  filter(
+    !is.na(file_name),
+    !is.na(x_true_m),
+    !is.na(y_true_m),
+    !is.na(month),
+    !is.na(year),
+    !is.na(tide_height_m),
+    !is.na(moon_illumination)
+  ) %>%
+  mutate(
+    month = factor(as.character(month), levels = month_levels),
+    year  = factor(as.character(year), levels = year_levels),
+    x_cell = floor(x_true_m / cell_size),
+    y_cell = floor(y_true_m / cell_size)
+  )
+
+# Track effort = total number of 2-sec fixes in each track
+track_effort <- gps_use %>%
+  count(file_name, name = "n_fixes_track") %>%
+  mutate(log_effort = log(n_fixes_track))
+
+# Aggregate number of 2-sec fixes per track x cell
+gps_cells <- gps_use %>%
+  group_by(
+    file_name, year, month,
+    tide_height_m, moon_illumination,
+    x_cell, y_cell
+  ) %>%
+  summarise(
+    n_fixes_cell = n(),
+    .groups = "drop"
+  ) %>%
+  left_join(track_effort, by = "file_name") %>%
+  mutate(
+    seconds_in_cell = n_fixes_cell * 2,
+    cell_id  = as.integer(factor(paste(x_cell, y_cell, sep = "_"))),
+    track_id = as.integer(factor(file_name)),
+    month_id = as.integer(month),
+    year_id  = as.integer(year),
+    tide_s = as.numeric(scale(tide_height_m)),
+    moon_s = as.numeric(scale(moon_illumination))
+  )
+
+d_cells_nb <- list(
+  N = nrow(gps_cells),
+  count = gps_cells$n_fixes_cell,
+  month = gps_cells$month_id,
+  year = gps_cells$year_id,
+  track = gps_cells$track_id,
+  cell = gps_cells$cell_id,
+  tide = gps_cells$tide_s,
+  moon = gps_cells$moon_s,
+  log_effort = gps_cells$log_effort,
+  n_month = nlevels(gps_use$month),
+  n_year = nlevels(gps_use$year),
+  n_track = length(unique(gps_cells$track_id)),
+  n_cell = length(unique(gps_cells$cell_id))
+)
+
+# Negative binomial (gamma-Poisson) with effort offset and cell effect
+m_space_use <- ulam(
+  alist(
+    count ~ dgampois(lambda, phi),
+    log(lambda) <- log_effort +
+      a +
+      a_month[month] +
+      a_year[year] +
+      a_track[track] +
+      a_cell[cell] +
+      b_tide * tide +
+      b_moon * moon,
+
+    a ~ dnorm(0, 1),
+
+    a_month[month] ~ dnorm(0, sigma_month),
+    a_year[year] ~ dnorm(0, sigma_year),
+    a_track[track] ~ dnorm(0, sigma_track),
+    a_cell[cell] ~ dnorm(0, sigma_cell),
+
+    b_tide ~ dnorm(0, 1),
+    b_moon ~ dnorm(0, 1),
+
+    sigma_month ~ dexp(1),
+    sigma_year ~ dexp(1),
+    sigma_track ~ dexp(1),
+    sigma_cell ~ dexp(1),
+
+    phi ~ dexp(1)
+  ),
+  data = d_cells_nb,
+  chains = 4, cores = 4, iter = 2000
+)
+
+```
+
+```{r}
+#### Diagnostics and posterior summaries for track-level models
+#| cache: true
+
+## posterior summaries
+precis(m_track_y, depth = 2)
+precis(m_track_x, depth = 2)
+
+plot(precis(m_track_y, depth = 2))
+plot(precis(m_track_x, depth = 2))
+
+## trace/rank plots
+# Track Y
+par(mfrow = c(2,2))
+trankplot(m_track_y, ask = FALSE)
+par(mfrow = c(1,1))
+
+# Track X
+par(mfrow = c(2,2))
+trankplot(m_track_x, ask = FALSE)
+par(mfrow = c(1,1))
+
+
+## convergence check
+summary(m_track_y)
+summary(m_track_x)
+
+## posterior predictive check
+y_sim <- sim(m_track_y, n = 1000)
+
+dens(d_track_y_scaled$Y)
+for(i in 1:50) dens(y_sim[i,], add = TRUE, col = col.alpha("blue", 0.1))
+title("Posterior predictive check: m_track_y")
+
+
+x_sim <- sim(m_track_x, n = 1000)
+
+dens(d_track_x_scaled$Y)
+for(i in 1:50) dens(x_sim[i,], add = TRUE, col = col.alpha("blue", 0.1))
+title("Posterior predictive check: m_track_x")
+
+
+#### Diagnostics and posterior summaries for space-use model
+
+## posterior summaries
+precis(m_space_use, depth = 2)
+plot(precis(m_space_use, depth = 2))
+
+par(mfrow = c(2,2))
+trankplot(m_space_use, ask = FALSE)
+par(mfrow = c(1,1))
+
+## convergence check
+summary(m_space_use)
+
+## posterior predictive check
+x_sim <- sim(m_space_use, n = 1000)
+
+hist(d_cells_nb$count, breaks = 30, col = "grey",
+     main = "Observed vs simulated counts")
+for(i in 1:50) {
+  hist(x_sim[i,], breaks = 30,
+       col = col.alpha("blue", 0.1), add = TRUE)
+}
+
+mean_sim <- apply(x_sim, 1, mean)
+dens(mean_sim, col = "blue")
+abline(v = mean(d_cells_nb$count), lwd = 2)
+title("Mean check")
+
+var_sim <- apply(x_sim, 1, var)
+dens(var_sim, col = "blue")
+abline(v = var(d_cells_nb$count), lwd = 2)
+title("Variance check")
+
+zero_sim <- apply(x_sim, 1, function(x) sum(x == 0))
+dens(zero_sim, col = "blue")
+abline(v = sum(d_cells_nb$count == 0), lwd = 2)
+title("Zero count check")
+
+max_sim <- apply(x_sim, 1, max)
+dens(max_sim, col = "blue")
+abline(v = max(d_cells_nb$count), lwd = 2)
+title("Maximum count check")
+
+```
+
+```{r}
+post <- extract.samples(m_space_use)
+
+cell_hotspots <- gps_cells %>%
+  distinct(cell_id, x_cell, y_cell) %>%
+  arrange(cell_id) %>%
+  mutate(
+    mean_cell_effect = apply(post$a_cell, 2, mean),
+    lpi_cell_effect  = apply(post$a_cell, 2, PI, prob = 0.89)[1, ],
+    upi_cell_effect  = apply(post$a_cell, 2, PI, prob = 0.89)[2, ]
+  ) %>%
+  arrange(desc(mean_cell_effect))
+
+head(cell_hotspots, 20)
+```
+
+```{r}
+### Extreme hotspot
+
+# Extract posterior samples
+post <- extract.samples(m_space_use)
+
+# compute mean cell effect
+cell_effect <- apply(post$a_cell, 2, mean)
+cell_low    <- apply(post$a_cell, 2, PI, prob = 0.89)[1, ]
+cell_high   <- apply(post$a_cell, 2, PI, prob = 0.89)[2, ]
+
+# attach back to your spatial data
+cell_map <- gps_cells %>%
+  distinct(cell_id, x_cell, y_cell) %>%
+  arrange(cell_id) %>%
+  mutate(
+    effect = cell_effect,
+    low    = cell_low,
+    high   = cell_high
+  )
+
+cell_map <- cell_map %>%
+  mutate(
+    intensity = exp(effect)
+  )
+
+library(ggplot2)
+
+threshold <- quantile(cell_map$intensity, 0.9)
+
+cell_map <- cell_map %>%
+  mutate(
+    hotspot = intensity > threshold
+  )
+
+ggplot(cell_map, aes(x = x_cell, y = y_cell)) +
+  geom_tile(aes(fill = intensity)) +
+  geom_point(data = subset(cell_map, hotspot),
+             color = "red", size = 2) +
+  scale_fill_viridis_c(option = "turbo") +
+  coord_equal() +
+  theme_minimal()
+
+```
+
+```{r}
+### Consecutive points in the same cell
+
+# create bouts
+library(dplyr)
+
+cell_size <- 50
+
+gps_bouts <- gps_env %>%
+  arrange(file_name, datetime_local) %>%   # IMPORTANT: time order
+  mutate(
+    x_cell = floor(x_true_m / cell_size),
+    y_cell = floor(y_true_m / cell_size),
+    cell_id = paste(x_cell, y_cell, sep = "_")
+  ) %>%
+  group_by(file_name) %>%
+  mutate(
+    new_bout = cell_id != lag(cell_id, default = first(cell_id)),
+    bout_id = cumsum(new_bout)
+  ) %>%
+  ungroup()
+
+#calculate bout duration
+bouts_summary <- gps_bouts %>%
+  group_by(file_name, cell_id, bout_id) %>%
+  summarise(
+    n_points = n(),
+    duration_sec = n_points * 2,
+    .groups = "drop"
+  )
+
+# summarise per track-cell
+cell_behavior <- bouts_summary %>%
+  group_by(file_name, cell_id) %>%
+  summarise(
+    n_visits = n(),                         # number of bouts
+    total_time = sum(duration_sec),         # total time in cell
+    mean_duration = mean(duration_sec),     # average stay
+    max_duration = max(duration_sec),       # longest stay
+    .groups = "drop"
+  )
+
+View(cell_behavior)
+```
+
+```{r}
+## Map
+
+library(tidyr)
+
+# Attach spatial coordinates
+cell_behavior <- cell_behavior %>%
+  separate(cell_id, into = c("x_cell", "y_cell"), sep = "_") %>%
+  mutate(
+    x_cell = as.numeric(x_cell),
+    y_cell = as.numeric(y_cell)
+  )
+
+## Total time (log scale)
+ggplot(cell_behavior, aes(x = x_cell, y = y_cell, fill = log1p(total_time))) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  labs(
+    title = "Total residence time per cell",
+    fill = "log(1 + seconds)"
+  ) +
+  theme_minimal()
+
+## Maximum duration (log scale)
+ggplot(cell_behavior, aes(x = x_cell, y = y_cell, fill = log1p(max_duration))) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  labs(
+    title = "Maximum residence time per cell",
+    fill = "log(1 + seconds)"
+  ) +
+  theme_minimal()
+
+## number of visits
+ggplot(cell_behavior, aes(x = x_cell, y = y_cell, fill = n_visits)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  coord_equal() +
+  labs(
+    title = "Number of revisits per cell",
+    fill = "Visits"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+### Classify behavior per cell
+
+cell_behavior <- cell_behavior %>%
+  mutate(
+    high_time = total_time > median(total_time),
+    high_visit = n_visits > median(n_visits),
+
+    behavior = case_when(
+      high_time & high_visit ~ "Core area",
+      high_time & !high_visit ~ "Long stay",
+      !high_time & high_visit ~ "Revisited",
+      TRUE ~ "Transit"
+    )
+  )
+
+ggplot(cell_behavior, aes(x = x_cell, y = y_cell, fill = behavior)) +
+  geom_tile(color = "white", size = 0.1) +
+  scale_fill_manual(values = c(
+    "Core area" = "red",
+    "Long stay" = "orange",
+    "Revisited" = "blue",
+    "Transit" = "grey80"
+  )) +
+  coord_equal() +
+  theme_minimal() +
+  labs(title = "Behavioral use of space")
+
+
+
+```
+
+```{r}
+## Aggregate Bayesian intensity map into 50m cells
+cell_map_agg <- cell_map %>%
+  mutate(
+    x_cell_agg = floor(x_cell / 2),
+    y_cell_agg = floor(y_cell / 2)
+  ) %>%
+  group_by(x_cell_agg, y_cell_agg) %>%
+  summarise(
+    intensity = mean(intensity, na.rm = TRUE),
+    effect = mean(effect, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(
+    x_cell = x_cell_agg,
+    y_cell = y_cell_agg
+  )
+
+
+### compare datasets and test agreement
+compare_map <- cell_behavior %>%
+  left_join(cell_map_agg, by = c("x_cell", "y_cell"))
+
+
+## side by side comparison
+library(ggplot2)
+library(patchwork)
+
+p1 <- ggplot(cell_map_agg, aes(x = x_cell, y = y_cell, fill = intensity)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "plasma") +
+  coord_equal() +
+  theme_minimal() +
+  labs(
+    title = "Bayesian intensity map",
+    fill = "Intensity"
+  )
+
+p2 <- ggplot(cell_behavior, aes(x = x_cell, y = y_cell, fill = behavior)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  scale_fill_manual(values = c(
+    "Core area" = "red",
+    "Long stay" = "orange",
+    "Revisited" = "blue",
+    "Transit" = "grey80"
+  )) +
+  coord_equal() +
+  theme_minimal() +
+  labs(
+    title = "Behavioral classification",
+    fill = "Behavior"
+  )
+
+p1 + p2
+
+
+
+## comparison map
+compare_map <- compare_map %>%
+  mutate(
+    intensity_z = scale(intensity)
+  )
+
+
+ggplot(compare_map, aes(x = behavior, y = intensity_z, fill = behavior)) +
+  geom_boxplot() +
+  theme_minimal()
+```
+
+```{r}
+### Bout duration Gaussian model 
+
+# First extract one row per bout with environmental data
+bout_covariates <- gps_bouts %>%
+  group_by(file_name, bout_id) %>%
+  summarise(
+    tide_height_m = first(tide_height_m),
+    moon_illumination = first(moon_illumination),
+    month = first(month),
+    year = first(year),
+    .groups = "drop"
+  )
+
+# Join with bout durations
+bout_data <- bouts_summary %>%
+  left_join(bout_covariates, by = c("file_name", "bout_id"))
+
+# prepare variables
+bout_data <- bout_data %>%
+  filter(duration_sec > 0) %>%   # just in case
+  mutate(
+    log_duration = log(duration_sec),
+
+    # IDs for hierarchical effects
+    month_id = as.integer(factor(month)),
+    year_id = as.integer(factor(year)),
+    track_id = as.integer(factor(file_name)),
+
+    # standardize predictors
+    tide_s = as.numeric(scale(tide_height_m)),
+    moon_s = as.numeric(scale(moon_illumination))
+  )
+
+# build data luist for ulam
+d_bout <- list(
+  N = nrow(bout_data),
+  Y = bout_data$log_duration,
+  tide = bout_data$tide_s,
+  moon = bout_data$moon_s,
+  month = bout_data$month_id,
+  year = bout_data$year_id,
+  track = bout_data$track_id,
+
+  n_month = length(unique(bout_data$month_id)),
+  n_year = length(unique(bout_data$year_id)),
+  n_track = length(unique(bout_data$track_id))
+)
+
+# Full bout model
+library(rethinking)
+
+m_bout <- ulam(
+  alist(
+    Y ~ dnorm(mu, sigma),
+
+    mu <- a +
+          a_month[month] +
+          a_year[year] +
+          a_track[track] +
+          b_tide * tide +
+          b_moon * moon,
+
+    # priors
+    a ~ dnorm(0, 1),
+
+    a_month[month] ~ dnorm(0, sigma_month),
+    a_year[year] ~ dnorm(0, sigma_year),
+    a_track[track] ~ dnorm(0, sigma_track),
+
+    b_tide ~ dnorm(0, 1),
+    b_moon ~ dnorm(0, 1),
+
+    sigma ~ dexp(1),
+    sigma_month ~ dexp(1),
+    sigma_year ~ dexp(1),
+    sigma_track ~ dexp(1)
+  ),
+  data = d_bout,
+  chains = 4,
+  cores = 4,
+  iter = 2000
+)
+
+# predicted effect of tide
+tide_seq_m <- seq(min(bout_data$tide_height_m),
+                  max(bout_data$tide_height_m),
+                  length.out = 100)
+
+tide_seq_s <- (tide_seq_m - mean(bout_data$tide_height_m)) /
+              sd(bout_data$tide_height_m)
+
+pred_data <- list(
+  tide = tide_seq_s,
+  moon = rep(0, length(tide_seq_s)),
+  month = rep(1, length(tide_seq_s)),
+  year = rep(1, length(tide_seq_s)),
+  track = rep(1, length(tide_seq_s))
+)
+
+mu <- link(m_bout, data = pred_data)
+
+mu_mean <- apply(mu, 2, function(x) mean(x, na.rm = TRUE))
+
+mu_PI <- apply(mu, 2, function(x)
+  quantile(x, probs = c(0.055, 0.945), na.rm = TRUE)
+)
+
+pred_df <- data.frame(
+  tide_m = tide_seq_m,                  
+  duration = exp(mu_mean),
+  low = exp(mu_PI[1, ]),
+  high = exp(mu_PI[2, ])
+)
+
+ggplot(bout_data, aes(x = tide_height_m, y = duration_sec)) +
+  geom_point(alpha = 0.1) +
+  geom_line(data = pred_df,
+            aes(x = tide_m, y = duration),
+            color = "red", size = 1.2) +
+  geom_ribbon(data = pred_df,
+              aes(x = tide_m, ymin = low, ymax = high),
+              alpha = 0.2,
+              inherit.aes = FALSE) +
+  scale_y_log10() +
+  labs(
+    x = "Tide height (m)",
+    y = "Bout duration (seconds)",
+    title = "Effect of tide on shark residence time"
+  ) +
+  theme_minimal()
+
+
+precis(m_bout, depth = 2)
+
+precis(m_bout, pars = c("b_tide", "b_moon"))
+
+y_sim <- sim(m_bout, n = 1000)
+
+dens(d_bout$Y)
+for(i in 1:50) dens(y_sim[i,], add = TRUE, col = col.alpha("blue", 0.1))
+
+post <- extract.samples(m_bout)
+
+mean(exp(post$b_tide))
+mean(exp(post$b_moon))
+```
+
+```{r}
+## Probability of long-stay vs transit
+
+# response variable (bout level)
+threshold <- quantile(bout_data$duration_sec, 0.75, na.rm = TRUE)
+
+bout_data <- bout_data %>%
+  mutate(
+    long_stay = ifelse(duration_sec >= threshold, 1, 0)
+  )
+
+# build data
+d_longstay <- list(
+  N = nrow(bout_data),
+  Y = bout_data$long_stay,
+
+  tide = bout_data$tide_s,
+  moon = bout_data$moon_s,
+  month = bout_data$month_id,
+  year = bout_data$year_id,
+  track = bout_data$track_id,
+
+  n_month = length(unique(bout_data$month_id)),
+  n_year = length(unique(bout_data$year_id)),
+  n_track = length(unique(bout_data$track_id))
+)
+
+d_longstay <- list(
+  N = nrow(bout_data),
+  Y = bout_data$long_stay,
+
+  tide = bout_data$tide_s,
+  moon = bout_data$moon_s,
+  month = bout_data$month_id,
+  year = bout_data$year_id,
+  track = bout_data$track_id,
+
+  n_month = length(unique(bout_data$month_id)),
+  n_year = length(unique(bout_data$year_id)),
+  n_track = length(unique(bout_data$track_id))
+)
+
+# Bayesian logistic model
+library(rethinking)
+
+m_longstay <- ulam(
+  alist(
+    Y ~ dbern(p),
+
+    logit(p) <- a +
+                a_year[year] +
+                a_track[track] +
+                b_tide * tide +
+                b_moon * moon,
+
+    a ~ dnorm(0, 1),
+
+    a_year[year] ~ dnorm(0, sigma_year),
+    a_track[track] ~ dnorm(0, sigma_track),
+
+    b_tide ~ dnorm(0, 1),
+    b_moon ~ dnorm(0, 1),
+
+    sigma_year ~ dexp(1),
+    sigma_track ~ dexp(1)
+  ),
+  data = d_longstay,
+  chains = 4,
+  cores = 4,
+  iter = 4000,
+  control = list(adapt_delta = 0.95)
+)
+
+precis(m_longstay, pars = c("b_tide", "b_moon"))
+
+# convert to odds ratios
+post <- extract.samples(m_longstay)
+
+mean(exp(post$b_tide))
+mean(exp(post$b_moon))
+
+```

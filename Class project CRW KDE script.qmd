@@ -1,0 +1,595 @@
+---
+title: "VZ class project CRW KDE script"
+format: pdf
+editor: visual
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+suppressWarnings(suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)     
+  library(stringr)
+  library(lubridate)
+  library(purrr)
+  library(brms)
+  library(cmdstanr)
+  library(posterior)
+  library(furrr)
+  library(future)
+  library(maptiles)
+  }))
+
+project_dir <- "C:/Users/vezuc/OneDrive - Florida International University/PhD/Classes/Bayesian"
+```
+
+## Read data
+
+```{r}
+gps_2s_clean <- read.csv(
+  file.path(project_dir, "gps_2s_clean.csv"),
+  stringsAsFactors = FALSE
+)
+```
+
+## Stan model with one track only
+
+```{r}
+##prepare
+library(dplyr)
+library(sf)
+library(cmdstanr)
+library(posterior)
+library(ggplot2)
+
+one_file <- gps_2s_clean %>%
+  filter(file_name == unique(gps_2s_clean$file_name)[1]) %>%
+  arrange(elapsed_sec) %>%
+  slice(1:300)
+
+## convert to sf and project to meters
+one_file_sf <- one_file %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) %>%
+  st_transform(32725)
+
+## Extract x/y in meters
+coords_m <- st_coordinates(one_file_sf)
+
+one_file <- one_file %>%
+  mutate(
+    x_m = coords_m[, 1],
+    y_m = coords_m[, 2]
+  )
+
+## center the meter coordinates
+one_file <- one_file %>%
+  mutate(
+    x_obs = x_m - mean(x_m),
+    y_obs = y_m - mean(y_m)
+  )
+
+## build Stan data
+track_dat <- list(
+  N = nrow(one_file),
+  x_obs = one_file$x_obs,
+  y_obs = one_file$y_obs
+)
+
+## CRW Stan model in meters
+writeLines("
+data {
+  int<lower=3> N;
+  vector[N] x_obs;
+  vector[N] y_obs;
+}
+parameters {
+  vector[N] x_true;
+  vector[N] y_true;
+  real<lower=0, upper=1> phi;
+  real<lower=0> sigma_gps;
+  real<lower=0> sigma_move;
+}
+transformed parameters {
+  vector[N-1] dx_true;
+  vector[N-1] dy_true;
+
+  for (t in 2:N) {
+    dx_true[t-1] = x_true[t] - x_true[t-1];
+    dy_true[t-1] = y_true[t] - y_true[t-1];
+  }
+}
+model {
+  phi ~ beta(2, 2);
+
+  sigma_gps ~ exponential(1);
+  sigma_move ~ exponential(1);
+
+  x_true[1] ~ normal(x_obs[1], 1);
+  y_true[1] ~ normal(y_obs[1], 1);
+
+  x_true[2] ~ normal(x_obs[2], 1);
+  y_true[2] ~ normal(y_obs[2], 1);
+
+  for (t in 2:(N-1)) {
+    dx_true[t] ~ normal(phi * dx_true[t-1], sigma_move);
+    dy_true[t] ~ normal(phi * dy_true[t-1], sigma_move);
+  }
+
+  x_obs ~ normal(x_true, sigma_gps);
+  y_obs ~ normal(y_true, sigma_gps);
+}
+generated quantities {
+  vector[N] x_rep;
+  vector[N] y_rep;
+
+  for (t in 1:N) {
+    x_rep[t] = normal_rng(x_true[t], sigma_gps);
+    y_rep[t] = normal_rng(y_true[t], sigma_gps);
+  }
+}
+", "shark_crw_meters.stan")
+
+
+## Fit the model
+mod_crw <- cmdstan_model("shark_crw_meters.stan")
+
+fit_crw <- mod_crw$sample(
+  data = track_dat,
+  chains = 4,
+  iter_warmup = 1000,
+  iter_sampling = 1000,
+  refresh = 0
+)
+```
+
+## Batch processing using meters-based CRW Stan model
+
+```{r}
+#| message: false
+#| warning: false
+library(dplyr)
+library(sf)
+library(posterior)
+library(purrr)
+library(readr)
+library(tidyr)
+
+fit_one_crw_track <- function(df_track, mod_crw) {
+  
+  df_track <- df_track %>%
+    arrange(elapsed_sec)
+  
+  if (nrow(df_track) < 3) return(NULL)
+  
+  track_sf <- df_track %>%
+    st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) %>%
+    st_transform(32725)
+  
+  coords_m <- st_coordinates(track_sf)
+  
+  df_track <- df_track %>%
+    mutate(
+      x_m = coords_m[, 1],
+      y_m = coords_m[, 2],
+      x_center = x_m - mean(x_m),
+      y_center = y_m - mean(y_m)
+    )
+  
+  track_dat <- list(
+    N = nrow(df_track),
+    x_obs = df_track$x_center,
+    y_obs = df_track$y_center
+  )
+  
+  fit <- mod_crw$sample(
+    data = track_dat,
+    chains = 4,
+    iter_warmup = 1000,
+    iter_sampling = 1000,
+    refresh = 0
+  )
+  
+  x_post <- fit$draws("x_true", format = "matrix")
+  y_post <- fit$draws("y_true", format = "matrix")
+  
+  x_mean <- colMeans(x_post) + mean(df_track$x_m)
+  y_mean <- colMeans(y_post) + mean(df_track$y_m)
+  
+  corrected_sf <- st_as_sf(
+    tibble(x_true_m = x_mean, y_true_m = y_mean),
+    coords = c("x_true_m", "y_true_m"),
+    crs = 32725,
+    remove = FALSE
+  ) %>%
+    st_transform(4326)
+  
+  coords_ll <- st_coordinates(corrected_sf)
+  
+  param_sum <- fit$summary(variables = c("phi", "sigma_gps", "sigma_move")) %>%
+    select(variable, mean) %>%
+    pivot_wider(names_from = variable, values_from = mean)
+  
+  out <- df_track %>%
+    mutate(
+      x_true_m = x_mean,
+      y_true_m = y_mean,
+      longitude_true = coords_ll[, 1],
+      latitude_true = coords_ll[, 2],
+      correction_dist_m = sqrt((x_m - x_true_m)^2 + (y_m - y_true_m)^2),
+      phi = param_sum$phi,
+      sigma_gps = param_sum$sigma_gps,
+      sigma_move = param_sum$sigma_move
+    )
+  
+  out
+}
+
+dir.create("crw_outputs", showWarnings = FALSE)
+dir.create("crw_outputs/track_files", showWarnings = FALSE)
+dir.create("crw_outputs/batch_files", showWarnings = FALSE)
+
+track_list <- gps_2s_clean %>%
+  group_by(file_name) %>%
+  group_split()
+
+batch_size <- 10
+track_indices <- seq_along(track_list)
+batch_ids <- split(track_indices, ceiling(seq_along(track_indices) / batch_size))
+
+all_batch_files <- character()
+
+for (b in seq_along(batch_ids)) {
+  
+  cat("Starting batch", b, "of", length(batch_ids), "\n")
+  
+  this_batch_idx <- batch_ids[[b]]
+  this_batch_tracks <- track_list[this_batch_idx]
+  batch_results <- vector("list", length(this_batch_tracks))
+  
+  for (i in seq_along(this_batch_tracks)) {
+    
+    this_track <- this_batch_tracks[[i]]
+    this_name <- this_track$file_name[1]
+    safe_name <- make.names(this_name)
+    track_outfile <- file.path("crw_outputs/track_files", paste0(safe_name, "_crw.csv"))
+    
+    if (file.exists(track_outfile)) {
+      cat("  Skipping already saved track:", this_name, "\n")
+      batch_results[[i]] <- read_csv(track_outfile, show_col_types = FALSE)
+      next
+    }
+    
+    cat("  Fitting track", i, "in batch", b, ":", this_name, "\n")
+    
+    fit_result <- tryCatch(
+      fit_one_crw_track(this_track, mod_crw),
+      error = function(e) {
+        message("    Failed on track: ", this_name)
+        message("    Error: ", e$message)
+        return(NULL)
+      }
+    )
+    
+    batch_results[[i]] <- fit_result
+    
+    if (!is.null(fit_result)) {
+      write_csv(fit_result, track_outfile)
+    }
+  }
+  
+  batch_df <- bind_rows(batch_results)
+  
+  batch_file <- file.path(
+    "crw_outputs/batch_files",
+    paste0("crw_batch_", sprintf("%03d", b), ".csv")
+  )
+  
+  write_csv(batch_df, batch_file)
+  all_batch_files <- c(all_batch_files, batch_file)
+  
+  cat("Finished batch", b, "- saved to:", batch_file, "\n")
+}
+
+batch_files <- list.files(
+  "crw_outputs/batch_files",
+  pattern = "^crw_batch_.*\\.csv$",
+  full.names = TRUE
+)
+
+gps_crw_all <- batch_files %>%
+  map_dfr(read_csv, show_col_types = FALSE)
+
+```
+
+```{r}
+meta_tide_moon <- read_csv(file.path(project_dir,"srt_metadata_with_tide_moon.csv"))
+
+gps_crw_all <- gps_crw_all %>%
+  dplyr::mutate(file_name = as.character(file_name)) %>%
+  dplyr::select(-dplyr::any_of(c(
+    "datetime_srt", "datetime_local",
+    "year", "year.x", "year.y",
+    "month_num", "month_num.x", "month_num.y",
+    "month", "month.x", "month.y",
+    "file_date", "file_date.x", "file_date.y"
+  ))) %>%
+  dplyr::left_join(meta_tide_moon, by = "file_name") %>%
+  dplyr::mutate(
+    year = lubridate::year(datetime_local),
+    month_num = lubridate::month(datetime_local),
+    month = factor(
+      lubridate::month(datetime_local, label = TRUE, abbr = TRUE),
+      levels = month.abb,
+      ordered = TRUE
+    ),
+    correction_dist_m = sqrt((x_true_m - x_obs)^2 + (y_true_m - y_obs)^2)
+  )
+
+# Save
+write_csv(gps_crw_all, "crw_outputs/gps_2s_clean_crw_all_tracks_enriched.csv")
+
+
+# =========================================
+# LOAD CLEAN DATASET
+# =========================================
+gps_crw_all <- readr::read_csv(
+  "crw_outputs/gps_crw_all_enriched_FINAL.csv",
+  show_col_types = FALSE
+)
+
+# =========================================
+#Track-level summary
+track_summary <- gps_crw_all %>%
+  group_by(file_name) %>%
+  summarise(
+    n = n(),
+    year = first(year),
+    month = first(month),
+    tide_height_m = first(tide_height_m),
+    tide_state = first(tide_state),
+    moon_phase = first(moon_phase),
+    moon_illumination = first(moon_illumination),
+    mean_correction = mean(correction_dist_m, na.rm = TRUE),
+    median_correction = median(correction_dist_m, na.rm = TRUE),
+    max_correction = max(correction_dist_m, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(track_summary, "crw_outputs/crw_track_summary.csv")
+
+gps_crw_all %>%
+  summarise(
+    mean_correction = mean(correction_dist_m, na.rm = TRUE),
+    median_correction = median(correction_dist_m, na.rm = TRUE),
+    max_correction = max(correction_dist_m, na.rm = TRUE)
+  )
+
+write_csv(gps_crw_all, "crw_outputs/gps_crw_all_enriched_FINAL.csv")
+
+##data integrity check
+
+gps_crw_all %>%
+  dplyr::count(year, month) %>%
+  tidyr::pivot_wider(names_from = month, values_from = n, values_fill = 0)
+```
+
+## Combine and summarise
+
+```{r}
+nrow(gps_crw_all)
+n_distinct(gps_crw_all$file_name)
+
+head(track_summary)
+
+summary(track_summary$phi)
+summary(track_summary$sigma_gps)
+summary(track_summary$sigma_move)
+summary(track_summary$mean_correction)
+summary(track_summary$median_correction)
+summary(track_summary$max_correction)
+```
+
+## Kernel density estimation in projected space (meters)
+
+```{r}
+library(dplyr)
+library(sf)
+library(terra)
+library(MASS)
+library(ggplot2)
+library(tidyterra)
+
+turbo_dark <- c(
+  "#30123B",
+  "#2C7FB8",
+  "#4AC16D",
+  "#F2C14E",
+  "#C81D11"
+)
+
+# make sure projected corrected coordinates exist
+# use gps_crw_all for corrected positions
+x_range <- range(gps_crw_all$x_true_m, na.rm = TRUE)
+y_range <- range(gps_crw_all$y_true_m, na.rm = TRUE)
+
+kde_m <- MASS::kde2d(
+  x = gps_crw_all$x_true_m,
+  y = gps_crw_all$y_true_m,
+  n = 300,
+  h = c(25, 25),
+  lims = c(x_range, y_range)
+)
+
+kde_m_df <- expand.grid(
+  x = kde_m$x,
+  y = kde_m$y
+)
+kde_m_df$z <- as.vector(kde_m$z)
+
+vals_m <- kde_m_df$z
+q_m <- quantile(vals_m, probs = seq(0, 1, length.out = 6), na.rm = TRUE)
+
+q_m[1] <- min(vals_m, na.rm = TRUE) - 1e-12
+q_m[length(q_m)] <- max(vals_m, na.rm = TRUE) + 1e-12
+
+kde_m_df <- kde_m_df %>%
+  mutate(
+    use_class = cut(
+      z,
+      breaks = q_m,
+      include.lowest = TRUE,
+      labels = c("Very low", "Low", "Moderate", "High", "Very high")
+    )
+  )
+
+p_hotspot_overall <- ggplot(kde_m_df, aes(x = x, y = y, fill = use_class)) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_manual(
+    values = turbo_dark,
+    drop = FALSE,
+    name = "Relative use"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 10)
+  ) +
+  labs(
+    x = "X (m)",
+    y = "Y (m)",
+    title = "Tiger shark core-use areas"
+  )
+
+p_hotspot_overall
+```
+
+## Kernel density estimation overlayed on basemap hotspot figure
+
+```{r}
+
+turbo_dark <- c(
+  "#30123B",
+  "#2C7FB8",
+  "#4AC16D",
+  "#F2C14E",
+  "#C81D11"
+)
+
+# --------------------------------------------------
+# 1. KDE in projected space (meters)
+# --------------------------------------------------
+x_range_m <- range(gps_crw_all$x_true_m, na.rm = TRUE)
+y_range_m <- range(gps_crw_all$y_true_m, na.rm = TRUE)
+
+kde_m <- MASS::kde2d(
+  x = gps_crw_all$x_true_m,
+  y = gps_crw_all$y_true_m,
+  n = 300,
+  h = c(25, 25),
+  lims = c(x_range_m, y_range_m)
+)
+
+# --------------------------------------------------
+# 2. Convert KDE grid to raster in UTM 25S
+# --------------------------------------------------
+kde_m_df <- expand.grid(
+  x = kde_m$x,
+  y = kde_m$y
+)
+kde_m_df$z <- as.vector(kde_m$z)
+
+kde_rast_utm <- rast(
+  kde_m_df,
+  type = "xyz",
+  crs = "EPSG:32725"
+)
+
+names(kde_rast_utm) <- "density"
+
+# --------------------------------------------------
+# 3. Reproject to lon/lat
+# --------------------------------------------------
+kde_rast_ll <- terra::project(kde_rast_utm, "EPSG:4326")
+kde_rast_ll[kde_rast_ll < quantile(values(kde_rast_ll), 0.05, na.rm = TRUE)] <- NA
+
+# --------------------------------------------------
+# 4. Convert to data frame for plotting
+# --------------------------------------------------
+# trim only the weakest background
+vals <- terra::values(kde_rast_ll)[, 1]
+thresh <- quantile(vals[vals > 0], 0.15, na.rm = TRUE)
+
+kde_trim <- kde_rast_ll
+kde_trim[kde_trim < thresh] <- NA
+
+# convert to data frame and drop NA cells
+kde_df_plot <- as.data.frame(kde_trim, xy = TRUE, na.rm = TRUE)
+names(kde_df_plot)[3] <- "density"
+
+##Make SF object
+gps_2s_sf <- gps_2s_clean %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+
+# Add satellite basemap
+bbox_sf <- st_as_sfc(st_bbox(gps_2s_sf)) %>%
+  st_buffer(0.0008)
+
+sat_map <- get_tiles(
+  x = bbox_sf,
+  provider = "Esri.WorldImagery",
+  crop = TRUE,
+  zoom = 17
+)
+
+## KDE basemap 
+p_basemap_context <- ggplot() +
+  geom_spatraster_rgb(data = sat_map) +
+  geom_raster(
+    data = kde_df_plot,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.65
+  ) +
+  coord_sf(
+    xlim = st_bbox(bbox_sf)[c("xmin", "xmax")],
+    ylim = st_bbox(bbox_sf)[c("ymin", "ymax")],
+    expand = FALSE
+  ) +
+  scale_fill_gradientn(
+  colours = turbo_dark,
+  values = scales::rescale(c(0, 0.05, 0.15, 0.40, 1)),
+  name = "Relative space use",
+  breaks = c(
+    min(kde_df_plot$density, na.rm = TRUE),
+    max(kde_df_plot$density, na.rm = TRUE)
+  ),
+  labels = c("Low", "High"),
+  guide = guide_colorbar(
+    reverse = TRUE,
+    barheight = unit(3.5, "cm"),
+    barwidth  = unit(0.4, "cm")
+      )
+  ) +
+  theme_void(base_size = 13) +
+  theme(
+    legend.position = "right",
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(0.4, "cm"),
+    legend.title = element_text(size = 10.5, face = "bold"),
+    legend.text = element_text(size = 9.5),
+    legend.background = element_rect(fill = "white", colour = "grey80")
+  ) +
+  labs(
+    title = "Tiger shark core-use areas",
+    caption = "Basemap: Esri World Imagery"
+  )
+
+p_basemap_context
+```
+
+\`\`\`
